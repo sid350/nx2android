@@ -1,5 +1,5 @@
 # Installing a port on a device over adb: the APK, then the data pack into the app's files folder (porter/adb.py pushes it in resumable pieces).
-# The player's own files there are kept: the pause menu's settings.txt, the logs, the Vulkan pipeline caches; saves are in the app's internal storage, which an update keeps.
+# The player's own files there are kept: the pause menu's settings.txt, the logs, the Vulkan pipeline caches, the saves (save/, env.txt's DM_SAVE: outside the folders the pack owns).
 import shlex
 from pathlib import Path
 
