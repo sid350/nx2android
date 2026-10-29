@@ -162,6 +162,24 @@ static void menu_drag(const ov_ctl *m, float x, float y, float W, float H) {   /
 // when it is a gamepad or a joystick and not virtual (the tablet's own keys, touch screen and pen are neither). While one is attached nothing of the gamepad
 // is shown and every touch is the game's; its keys open the menu (Back, Mode, Menu: handle_event). When the last one goes, the gamepad comes back ----
 static int jx(JNIEnv *E) { if (!(*E)->ExceptionCheck(E)) return 0; (*E)->ExceptionClear(E); return 1; }
+// ---- the system told a game is being played (on the main thread, at onCreate): GameManager.setGameState (Android 13) reaches the power HAL as its GAME
+// mode, which device makers may use for their game clocks. The Red Magic Astra took it ("game state: gameplay") but did not raise its clocks for it alone:
+// they rose with its FULL performance mode or its game menu open. DM_GAME_STATE=0: not told ----
+static void game_state(ANativeActivity *act) {
+    JNIEnv *E = act->env; jobject a = act->clazz; const char *e = getenv("DM_GAME_STATE");
+    if (!(e && !atoi(e))) {
+        jclass cA = (*E)->GetObjectClass(E, a); jmethodID mSvc = (*E)->GetMethodID(E, cA, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+        jstring nm = (*E)->NewStringUTF(E, "game"); jobject gm = mSvc ? (*E)->CallObjectMethod(E, a, mSvc, nm) : NULL; jx(E);
+        jclass cGS = (*E)->FindClass(E, "android/app/GameState"); jx(E);
+        jmethodID ctor = cGS ? (*E)->GetMethodID(E, cGS, "<init>", "(ZI)V") : NULL; jx(E);
+        if (gm && ctor) {
+            jobject gs = (*E)->NewObject(E, cGS, ctor, JNI_FALSE, 3);   // not loading, GameState.MODE_GAMEPLAY_UNINTERRUPTIBLE
+            jmethodID mSet = (*E)->GetMethodID(E, (*E)->GetObjectClass(E, gm), "setGameState", "(Landroid/app/GameState;)V");
+            if (gs && mSet) (*E)->CallVoidMethod(E, gm, mSet, gs);
+            LOG("[perf] game state: gameplay%s", jx(E) || !gs || !mSet ? " (refused)" : "");
+        } else LOG("[perf] game state: no GameManager on this Android");
+    }
+}
 static void *pad_watch(void *a) {
     JavaVM *vm = a; JNIEnv *E; pthread_setname_np(pthread_self(), "padwatch");
     if ((*vm)->AttachCurrentThread(vm, &E, NULL) != JNI_OK) { LOG("[RED] [input] cannot attach to the Java VM: attached controllers are not watched"); return NULL; }
@@ -527,7 +545,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
 #ifdef DM_RELEASE
     unsetenv("DM_CTL");   // a release build takes no remote key presses (the control file is a development tool)
 #endif
-    settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble));
+    settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble)); game_state(act);
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, saves %s", g_root, act->internalDataPath);
     pthread_t t; pthread_create(&t, NULL, input_thread, NULL); pthread_detach(t);
