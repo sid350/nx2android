@@ -356,6 +356,24 @@ static void ov_fps(VkCommandBuffer cb, int64_t now) {
         float u = (float)(c - OV_FPS_CHARS) * ov_fps_cell(); ov_rect(cb, x, m + pad, x + cw, m + pad + ch, u, gy, u + ov_fps_cell(), gy + g_ov.gh, 1);
     }
 }
+// The static layer is drawn only where it has something: runs of 32-texel tiles with a texel not fully clear, found when it is rasterized. As one quad over the
+// whole window it blended every pixel of it each frame: Super Mario Odyssey held 60 fps docked with the gamepad hidden (a controller in use) and fell to 30 for good
+// once a touch showed it again, while the frame rate counter, drawn in the same pass, cost nothing seen
+#define OV_TILE 32
+static uint16_t g_ov_runs[2048][3]; static int g_ov_nruns;   // tile row, first and last tile column of each run
+static void ov_tiles(const uint8_t *px, uint32_t w, uint32_t h) {
+    g_ov_nruns = 0;
+    for (uint32_t ty = 0; ty * OV_TILE < h; ty++) {
+        int run = -1;
+        for (uint32_t tx = 0; tx <= (w + OV_TILE - 1) / OV_TILE; tx++) {   // one column past the last tile closes a run that reaches the edge
+            int any = 0;
+            for (uint32_t y = ty * OV_TILE; !any && tx * OV_TILE < w && y < h && y < (ty + 1) * OV_TILE; y++)
+                for (uint32_t x = tx * OV_TILE; x < w && x < (tx + 1) * OV_TILE; x++) if (px[((size_t)y * w + x) * 4 + 3]) { any = 1; break; }
+            if (any && run < 0) run = (int)tx;
+            if (!any && run >= 0) { if (g_ov_nruns < 2048) { g_ov_runs[g_ov_nruns][0] = (uint16_t)ty; g_ov_runs[g_ov_nruns][1] = (uint16_t)run; g_ov_runs[g_ov_nruns][2] = (uint16_t)(tx - 1); g_ov_nruns++; } run = -1; }
+        }
+    }
+}
 static void ov_render(VkCommandBuffer cb, int mode, int menu, int fps) {
     float W = (float)g_sext.width, H = (float)g_sext.height;
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); int64_t now = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
@@ -365,7 +383,12 @@ static void ov_render(VkCommandBuffer cb, int mode, int menu, int fps) {
         float r[4]; ov_menu_rect(W, H, r);
         ov_rect(cb, r[0], r[1], r[0] + r[2], r[1] + r[3], 0, (float)(g_ov.h + g_ov.sh), (float)g_ov.pw, (float)(g_ov.h + g_ov.sh + g_ov.ph), 1);
     } else if (mode == 1) {
-        ov_rect(cb, 0, 0, W, H, 0, 0, (float)g_ov.w, (float)g_ov.h, 1);
+        float sx = W / g_ov.w, sy = H / g_ov.h;   // texels of the static layer to screen pixels
+        for (int i = 0; i < g_ov_nruns; i++) {
+            float u0 = (float)(g_ov_runs[i][1] * OV_TILE), u1 = fminf((float)((g_ov_runs[i][2] + 1) * OV_TILE), (float)g_ov.w);
+            float v0 = (float)(g_ov_runs[i][0] * OV_TILE), v1 = fminf(v0 + OV_TILE, (float)g_ov.h);
+            ov_rect(cb, u0 * sx, v0 * sy, u1 * sx, v1 * sy, u0, v0, u1, v1, 1);
+        }
         for (int i = 0; i < OV_N; i++) { const ov_ctl *c = &OV_CTLS[i]; float cr = ov_r(c) * H;
             if (c->kind == OV_STICK_L || c->kind == OV_STICK_R) {
                 float dx, dy; dm_overlay_knob(c->kind == OV_STICK_R, &dx, &dy); float travel = cr * (1 - OV_KNOB);   // the knob's edge reaches the ring
@@ -442,7 +465,7 @@ static int overlay_ready(VkCommandBuffer cb, uint32_t k, int menu) {   // k: thi
         VkMemoryAllocateInfo bi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, bq.size, vk_mem_type(bq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
         VKCHK(vkAllocateMemory(V.dev, &bi, NULL, &g_ov.upm)); VKCHK(vkBindBufferMemory(V.dev, g_ov.up, g_ov.upm, 0));
         void *px; VKCHK(vkMapMemory(V.dev, g_ov.upm, 0, VK_WHOLE_SIZE, 0, &px)); g_ov.px = px;
-        g_ov.w = w; g_ov.h = h; g_ov.sh = sh; ov_raster(g_ov.px, w, h, sh); memset(g_ov.px + (size_t)w * (h + sh) * 4, 0, (size_t)w * (g_ov.ph + g_ov.gh) * 4); ov_fps_glyphs();
+        g_ov.w = w; g_ov.h = h; g_ov.sh = sh; ov_raster(g_ov.px, w, h, sh); ov_tiles(g_ov.px, w, h); memset(g_ov.px + (size_t)w * (h + sh) * 4, 0, (size_t)w * (g_ov.ph + g_ov.gh) * 4); ov_fps_glyphs();
         VkDescriptorImageInfo ii = {g_ov.samp, g_ov.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, g_ov.set, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &ii};
         vkUpdateDescriptorSets(V.dev, 1, &wr, 0, NULL);
@@ -641,12 +664,12 @@ static uint64_t present_enqueue(vkimg_t *im, const int crop[4], uint64_t n, doub
     pthread_mutex_unlock(&g_pq_mu);
     return n;
 }
-void dm_perf_frame(double period); void dm_perf_window(ANativeWindow *w, double fps); void dm_perf_frame_cost(int64_t ns);   // perf_android.c
+void dm_perf_frame(double period); void dm_perf_window(ANativeWindow *w, double fps); void dm_perf_frame_cost(int64_t replay_ns, int64_t gpu_ns);   // perf_android.c
 uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     vk_init();
     { uint64_t vk_replay_ns(void); double vk_gpu_ms_recent(void);   // what else the frame costs: its replay and its GPU time
       static uint64_t last_exec; uint64_t ex = vk_replay_ns(), rp = ex - last_exec; last_exec = ex; double g = vk_gpu_ms_recent(); int64_t gn = g > 0 ? (int64_t)(g * 1e6) : 0;
-      dm_perf_frame_cost((int64_t)rp > gn ? (int64_t)rp : gn); }
+      dm_perf_frame_cost((int64_t)rp, gn); }
     dm_perf_frame(period);   // paced to the game's frame period, and its work time reported to ADPF
     static ANativeWindow *rate_win; static double rate_period;
     if (g_win && (g_win != rate_win || period != rate_period)) { rate_win = g_win; rate_period = period; dm_perf_window(g_win, period > 0 ? 1.0 / period : 60); }
