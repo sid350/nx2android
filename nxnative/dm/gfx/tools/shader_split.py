@@ -1379,7 +1379,9 @@ def main():
     files, results, common = [], [], None
     for i, (romfs, mainnso) in enumerate(zip(romfs_v, main_v)):
         tag = os.path.basename(os.path.dirname(os.path.abspath(romfs))) if i else ''
-        files += sorted((os.path.join(dp, f), (tag + '/' if tag else '') + os.path.relpath(os.path.join(dp, f), romfs)) for dp, _, fs in os.walk(romfs) for f in fs)
+        # '/' in the source column and in the sort order on every host: Windows' '\' missed the profile's shader_groups prefixes and sorted files differently (Metroid Dread's tables)
+        files += sorted(((os.path.join(dp, f), (tag + '/' if tag else '') + os.path.relpath(os.path.join(dp, f), romfs).replace(os.sep, '/')) for dp, _, fs in os.walk(romfs) for f in fs),
+                        key=lambda t: t[0].replace(os.sep, '/'))
         img = nso_image(mainnso)
         if not i:
             import unityfs
@@ -1405,7 +1407,8 @@ def main():
     # maps and effects in an archive of its own (aoc/4/bf3_dlc04.ard). Scanned like a version's RomFS, under aoc/<index>/
     aoc = os.environ.get('DM_SPLIT_AOC')
     if aoc and os.path.isdir(aoc):
-        files += sorted((os.path.join(dp, f), 'aoc/' + os.path.relpath(os.path.join(dp, f), aoc).replace(os.sep, '/')) for dp, _, fs in os.walk(aoc) for f in fs)
+        files += sorted(((os.path.join(dp, f), 'aoc/' + os.path.relpath(os.path.join(dp, f), aoc).replace(os.sep, '/')) for dp, _, fs in os.walk(aoc) for f in fs),
+                        key=lambda t: t[0].replace(os.sep, '/'))
     zdicts = {k: v for r in romfs_v for k, v in zs_dicts(r).items()}   # Tears of the Kingdom's zstd dictionaries (zs_dicts)
     keys = {}
     # First pass: every file; Unity bundles carry type trees, and the Shader trees are collected on the way. Second pass: Unity serialized files without type trees are scanned again with the borrowed trees
