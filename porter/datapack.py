@@ -51,6 +51,8 @@ def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, 
     rows = [f'# Written by nx2android\'s porter for {profile.name} ({profile.id}); KEY=VALUE per line, read by the app at launch',
             f'DM_LANG={language}']
     if aoc: rows.append(f'DM_AOC_DIR={files_folder(package)}/aoc')
+    # saves in the files folder instead of internal storage: reachable over adb / USB, so the player can carry them to and from the iOS port (same layout: hle_fs.c)
+    rows.append(f'DM_SAVE={files_folder(package)}/save')
     rows += profile.env + list(env)
     (tmp / 'env.txt').write_text('\n'.join(rows) + '\n', encoding='utf-8', newline='\n')
     if profile.settings: (tmp / 'settings.txt').write_text(''.join(f'{k}={v}\n' for k, v in profile.settings.items()), encoding='utf-8', newline='\n')
