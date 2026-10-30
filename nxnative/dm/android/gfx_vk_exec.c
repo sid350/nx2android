@@ -18,7 +18,7 @@ int prog_key(const prog_t *p, unsigned st, uint8_t key[8]);
 
 // ---------------- NVN state shadow ----------------
 static struct {
-    const prog_t *prog; vkshader_t *sh[6]; int prog_ok;
+    const prog_t *prog; vkshader_t *sh[6]; int prog_ok, fs_miss;
     p_bind_buf ubo[6][16], ssbo[6][16];
     uint64_t tex[6][256], samp[6][128], img[6][32];
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
@@ -627,17 +627,24 @@ static void bind_program(const p_bind_program *bp) {
     int vk_shader_stage(uint64_t key);
     uint32_t mask = bp->stages ? (uint32_t)bp->stages & 0x3f : 0x3f;
     for (int st = 0; st < 6; st++) if (mask >> st & 1) S.sh[st] = NULL;
+    // A fragment stage left empty by the bind itself (a null program, or a program without one) is a vertex-only draw: Metroid Dread's depth prepass binds
+    // (program, vertex | fragment), then (null, fragment), and draws depth with the vertex shader alone (as nvn_mtl.m bind_stages). Such draws used to be
+    // skipped as "no program": depth stayed empty, the G-buffer's depth EQUAL test passed no pixel, and from the second area on the scene was black.
+    // fs_miss marks a fragment stage that is empty because its shader is not in the bundle: those draws are still skipped
+    if (mask >> 1 & 1) S.fs_miss = 0;
     S.prog = bp->prog;
     if (S.prog) for (unsigned i = 0; i < 6; i++) {
         uint8_t k[8]; if (!prog_key(S.prog, i, k)) break;
         uint64_t kk = key64(k); int st = kk ? vk_shader_stage(kk) : -1;
         if (kk && st < 0) {   // the draw or dispatch is skipped. Logged once per shader (the first 16 binds were 4 shaders of Xenoblade Chronicles 3 over and over, which hid others)
+            if (mask >> 1 & 1) S.fs_miss = 1;   // its stage is unknown: it may be the fragment one
             static uint64_t seen[256]; static int nseen; int known = 0; for (int j = 0; j < nseen; j++) if (seen[j] == kk) { known = 1; break; }
             if (!known && nseen < 256) { seen[nseen++] = kk; void vk_shader_missing(uint64_t key); vk_shader_missing(kk); shader_dump(S.prog, i, kk); } }
         if (st < 0 || st > 5 || !(mask >> st & 1)) continue;
         S.sh[st] = vk_shader(kk, st);
+        if (st == 1 && !S.sh[1]) S.fs_miss = 1;
     }
-    S.prog_ok = (S.sh[0] && (S.sh[1] || S.rast_discard)) || S.sh[5];
+    S.prog_ok = (S.sh[0] && (S.sh[1] || S.rast_discard || !S.fs_miss)) || S.sh[5];
 }
 typedef struct {
     uint64_t key[3]; uint32_t topo, restart, raster_discard, cull, front, mode, depth_clamp, bias_en;
@@ -1084,7 +1091,7 @@ static int prepare_draw(int prim, int indexed) {
     int var = g_bis_trace >= 0 && g_draw_i >= g_bis_trace ? g_bis_var : 0; if (g_bis_var) g_tracing = 0;   // full logs only the first time
     g_var_now = 0;
     if (var == 6) vk_end_pass();   // a new pass for this draw
-    if (!(S.sh[0] && (S.sh[1] || S.rast_discard))) { g_vkst.skip_prog++; VKRED_ONCE(50, "draw with a program whose shaders are not in the bundle: skipped"); return 0; }
+    if (!(S.sh[0] && (S.sh[1] || S.rast_discard || !S.fs_miss))) { g_vkst.skip_prog++; VKRED_ONCE(50, "draw with a program whose shaders are not in the bundle: skipped"); return 0; }
     if (g_x_nogs && S.sh[2]) return 0;   // DM_VK_X_NOGS=1 (live, A/B): draws with a geometry shader are left out
     for (int i = 0; i < g_x_nskipvs; i++) if (S.sh[0]->key == g_x_skipvs[i]) return 0;   // DM_VK_X_SKIPVS=<key>[,<key>...] (live, up to 8): draws with these vertex shaders are left out
     // A run of draws with rasterizer discard gets a pass of its own: the pass ends where such a run begins and where it ends (and begin_pass puts a barrier
@@ -1164,7 +1171,7 @@ static int prepare_draw(int prim, int indexed) {
     k.logic_op = S.color.logic_op;
     for (int i = 0; i < S.ncol; i++) {
         k.cfmt[i] = S.cfmt[i];
-        k.wmask[i] = S.cfmt[i] ? (S.chmask.mask >> (4 * i)) & 0xf : 0;
+        k.wmask[i] = S.cfmt[i] && (S.sh[1] || S.rast_discard) ? (S.chmask.mask >> (4 * i)) & 0xf : 0;   // a vertex-only draw writes no colour (its values would be undefined)
         const vkfmt_t *f = S.rt_has_col[i] ? vk_fmt(S.rt_col[i].d.format) : NULL;
         if (((S.color.blend_en >> i) & 1) && f && !f->is_int) {
             k.blend_en |= 1u << i;
