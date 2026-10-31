@@ -1414,16 +1414,13 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     }
     g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
+    uint64_t tk = *idx < 4 ? __atomic_load_n(&o->ticket[*idx], __ATOMIC_ACQUIRE) : 0;
+    if (tk & ASYNC_FENCE) { uint64_t w0 = now_ns(); job_wait(tk & ~ASYNC_FENCE, ~0ull); g_pq_wait_ns += now_ns() - w0; tk = __atomic_load_n(&o->ticket[*idx], __ATOMIC_ACQUIRE); }   // its present still queued
     // The wait for the present thread (pq_ns) goes to the adaptive frame rate apart from the frame's work: at 40 or 30 fps it is the longer period's own pace
     // (Super Mario Odyssey's title held 30 fps with 1 ms of GPU work a frame and showed 60 when pinned there). The CPU hint still counts it as work: with the
-    // replay on its own thread it holds the replay's and the GPU's time too, and without it the hint let the CPU clocks fall to 1 GHz (perf_android.c).
-    // With the replay on its own thread the pace can be in the wait for the present's job (the replay thread held by the full present queue); the replay's
-    // own time in that wait comes back to the rate as the frame's replay time (dm_perf_frame_cost)
+    // replay on its own thread it holds the replay's and the GPU's time too, and without it the hint let the CPU clocks fall to 1 GHz (perf_android.c)
     uint64_t pq_ns = 0;
-    uint64_t tk = *idx < 4 ? __atomic_load_n(&o->ticket[*idx], __ATOMIC_ACQUIRE) : 0;
-    if (tk & ASYNC_FENCE) { uint64_t w0 = now_ns(); job_wait(tk & ~ASYNC_FENCE, ~0ull); pq_ns = now_ns() - w0; tk = __atomic_load_n(&o->ticket[*idx], __ATOMIC_ACQUIRE); }   // its present still queued
-    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); pq_ns += now_ns() - w0; }
-    g_pq_wait_ns += pq_ns;
+    if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); pq_ns = now_ns() - w0; g_pq_wait_ns += pq_ns; }
     // The sync signals when the texture is available: once the work before its last present is done, as Horizon releases a swap-chain image (not all work so far).
     // Xenoblade Chronicles 3 waits on it on the CPU right after presenting frame N, before it submits N+1: fenced "now", that wait took frame N's whole GPU tail
     // (frame = replay + GPU tail, ~16 ms of 33), so the GPU never ran a frame while the next one was replayed. DM_NVN_ACQ_NOW=1: the old fence (all work so far)

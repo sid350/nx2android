@@ -17,3 +17,10 @@ status	playable
 tested	v393216 Lenovo Legion Y700 TB322FC (Snapdragon 8 Elite, Adreno 830, Android 16)
 package	org.nx2a.supermarioodyssey
 orientation	landscape
+# Red Magic Astra (Snapdragon 8 Elite), local: the set that held 60 fps there (2026-10-28); no frame-rate step-down, command buffers every 32 draws
+env	DM_ADAPTIVE_FPS=0
+env	DM_VK_CB_DRAWS=32
+env	DM_NVN_ASYNC=1
+env	DM_VK_SETSPLIT=1
+env	DM_VK_PASS_SPLIT=512
+env	DM_ADAPT_UP_PCT=50
