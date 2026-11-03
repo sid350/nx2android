@@ -1,4 +1,5 @@
-# The port: a game folder (NSP / XCI, or NSZ / XCZ: porter.dumps) + prod.keys + the game's profile → <App>.apk and <App>-data/ (docs/ARCHITECTURE.md "The port").
+# The port: a game folder (NSP / XCI, or NSZ / XCZ: porter.dumps) + prod.keys + the game's profile → <App>.apk and <App>-data/ (docs/ARCHITECTURE.md "The port"),
+# or with --single-apk one <App>.apk that carries the data pack itself.
 # The steps every platform shares are upstream's (porter.upstream.nsp: scan, extraction, the shader split, stage reuse, progress); the Android ones are here:
 # the rewrite for DM_TARGET=android, the Vulkan shader bundle, the host built with the player's NDK, the APK, the data pack and the install.
 # Work files go where upstream's NSP script puts them, <game folder>/<title ID>_build/ (extract/, aoc/, shader/, logs/ are shared with an iOS build of the same folder),
@@ -36,6 +37,7 @@ class Options:
     touch: bool = False                # a game played by touch: the on-screen gamepad starts hidden (TOUCH_SETTINGS), so it takes none of the game's touches
     vercode_offset: int = 0            # added to the APK's versionCode: a rebuild of the same game version installs over a build with a higher one (version_code)
     alias_headroom: int = None         # GB more alias region (alias_headroom); None: ALIAS_HEADROOM for a version the profile was not brought up on, none for one it was
+    single_apk: bool = False           # the data pack goes into the APK (assets/nx2a/, read in place by the app): one APK to install, no data pack beside it
     jobs: int = field(default_factory=lambda: os.cpu_count() or 8)
 
 
@@ -182,13 +184,13 @@ class Port:
         if o.install: self.pull_captures()
         self.shaders()
         self.host()
-        self.apk()
-        self.data()
+        if o.single_apk: self.data(); self.apk()   # the pack is laid out first (hard links in the build folder), then copied into the APK
+        else: self.apk(); self.data()
         if o.install: self.install()
         nsp.rmtree(self.work / 'tmp')
         self.result.update(title_id=self.g.id, name=self.app_name, package=self.package, version=self.pkg_ver, display=self.display, language=self.lang,
                            status=self.ap.status, derived=bool(self.derived), installed=bool(o.install))
-        say(f'done: {self.result["apk"]} and {self.result["data"]}')
+        say(f'done: {self.result["apk"]}' + (' (the game\'s data inside: one APK to install)' if o.single_apk else f' and {self.result["data"]}'))
         if self.derived: say(f'[RED] {self.derived}: the port is built from a derived profile and may not run as the profile\'s tested version does'
                              + (f'; {self.derived_mem}' if self.derived_mem else ''))
         for x in self.lost: say(f'[RED] {x}')
@@ -467,7 +469,7 @@ class Port:
         if cuts:   # code bytes: the rewriter's cuts, applied before it rewrites main (patch_nso.py DM_PATCHES_EXTRA; part of the rewrite's reuse key)
             (d / 'patches.py').write_text(fpslocker.patches_py(bid, cuts, src), encoding='utf-8', newline='\n'); self.env['DM_PATCHES_EXTRA'] = str(d / 'patches.py')
         # FPSLocker paces the presents for its target itself, whatever interval the game asks for, so its configs leave the game's interval alone: presents follow the display (present_interval display)
-        self.fps_env = ['DM_FPS_TARGET=60', f'DM_FPS_LOCKS={datapack.files_folder(self.package)}/fpslock.tsv', 'DM_PRESENT_INTERVAL=display']
+        self.fps_env = ['DM_FPS_TARGET=60', f'DM_FPS_LOCKS={self.data_root()}/fpslock.tsv', 'DM_PRESENT_INTERVAL=display']
         self.fps_files = {'fpslock.tsv': d / 'fpslock.tsv'}
         n = tsv.count('\n') - 3
         say(f'60 fps: FPSLocker-Warehouse config {src}, by masagrator and contributors: {n} memory write(s)' + (f', {len(cuts)} code cut(s)' if cuts else ''))
@@ -548,18 +550,31 @@ class Port:
         if not self.so.is_file(): raise BuildError(f'build.py made no {self.so}')
         PROG.end(f'{self.so.stat().st_size / 2**20:.1f} MB')
 
-    # ---- apk: the host as a NativeActivity app, signed with the player's key ----
+    def data_root(self):   # where the app finds the pack's files: its files folder, or inside the APK (--single-apk, dm/host/packfs.h)
+        return datapack.PACK_ROOT if self.o.single_apk else datapack.files_folder(self.package)
+
+    # ---- apk: the host as a NativeActivity app, signed with the player's key (with --single-apk the data pack inside it) ----
+    APK_MAX = 1 << 32   # a zip without Zip64 (mkapk.py): under 4 GiB, at most 65,534 entries
     def apk(self):
         PROG.stage('APK')
         stem = app_stem(self.g, self.app_name)
         self.apk_path = self.o.out / f'{stem}.apk'; self.o.out.mkdir(parents=True, exist_ok=True)
+        pack = []
+        if self.o.single_apk:   # refused before gigabytes are copied: every entry takes its name twice (local and central header) and up to 16 KB of alignment
+            files = [f for f in self.data_path.rglob('*') if f.is_file()]
+            size = sum(f.stat().st_size for f in files)
+            est = self.so.stat().st_size + size + sum(2 * (46 + len(str(f.relative_to(self.data_path)).encode())) + 16384 for f in files) + (1 << 20)
+            if len(files) + 16 >= 0xffff: raise BuildError(f'--single-apk: the game has {len(files):,} files, more than one APK holds (65,534 entries without Zip64): port it without --single-apk')
+            if est >= self.APK_MAX: raise BuildError(f'--single-apk: the game makes an APK of about {est / 2**30:.2f} GiB, and an APK must stay under 4 GiB (no Zip64): port it without --single-apk')
+            pack = ['--pack', self.data_path]; PROG.set(step=f'packing {len(files):,} files, {size / 2**30:.2f} GB, into the APK')
         icon = self.icon()
         code = version_code(self.pkg_ver, self.o.vercode_offset)
         if self.o.vercode_offset: say(f'versionCode {code} ({self.pkg_ver} + 1 + offset {self.o.vercode_offset})')
         nsp.run([PY, DM / 'android/apk/mkapk.py', self.so, self.apk_path, paths.signing_key(), '--package', self.package, '--label', self.app_name, '--lib', 'dmhost',
                  '--version-code', str(code), '--version-name', self.display]
-                + (['--landscape'] if self.ap.landscape else []) + (['--icon', icon] if icon else []) + self.theme() + ([] if self.o.debug else ['--release']),
+                + (['--landscape'] if self.ap.landscape else []) + (['--icon', icon] if icon else []) + self.theme() + ([] if self.o.debug else ['--release']) + pack,
                 self.logs / 'android_apk.log', env=self.env)
+        if pack: nsp.rmtree(self.data_path)   # the pack is in the APK now: its layout of hard links goes, the build folder keeps no second copy
         self.result['apk'] = str(self.apk_path)
         PROG.end(f'{self.apk_path.name}, {self.apk_path.stat().st_size / 2**20:.1f} MB')
 
@@ -582,22 +597,23 @@ class Port:
         Image.open(src).convert('RGB').resize((256, 256), Image.LANCZOS).save(dst)
         return dst
 
-    # ---- data: the files the app reads from its files folder ----
+    # ---- data: the files the app reads from its files folder (--single-apk: from its APK; laid out in the build folder for apk() to pack) ----
     def data(self):
         PROG.stage('data pack', step='button-icon font')
-        font_env, font_files = self.button_font()
-        dst = self.o.out / f'{app_stem(self.g, self.app_name)}-data'
+        font_env, font_files = self.button_font(self.data_root())
+        dst = self.aw / 'apk-pack' if self.o.single_apk else self.o.out / f'{app_stem(self.g, self.app_name)}-data'
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=self.game / 'RomFS', shaders=self.dmsv,
                              aoc=self.aoc, language=self.lang, package=self.package, env=self.fps_env + font_env, settings=TOUCH_SETTINGS if self.o.touch else None,
-                             files={**self.fps_files, **font_files},
+                             files={**self.fps_files, **font_files}, single_apk=self.o.single_apk,
                              progress=lambda what: PROG.set(step=f'linking {what}'))
-        self.data_path = dst; self.result['data'] = str(dst)
+        self.data_path = dst
+        if not self.o.single_apk: self.result['data'] = str(dst)
         PROG.end(f'{man["files"]:,} files, {man["bytes"] / 2**30:.1f} GB')
 
-    def button_font(self):
+    def button_font(self, root=None):
         """The stand-in for the system's Nintendo extension shared font: the controller-button icons in game text (U+E0E0 = A; Super Mario Bros. Wonder's menus showed '?' without it), which
         the host serves for shared-font type 5 (hle_sdk16.c, DM_SHARED_FONT_EXT). make_ext_font.py draws it, as the Mac and iOS builds do, made again when the tool or the letters change.
-        Returns (env.txt rows, pack files); none without fontTools or a letter font, and the icons draw as '?'"""
+        root: where the app finds the pack (data_root; default the files folder). Returns (env.txt rows, pack files); none without fontTools or a letter font, and the icons draw as '?'"""
         letters = next((Path(p) for p in LETTER_FONTS if Path(p).is_file()), None)
         try: import fontTools   # noqa: F401 (make_ext_font.py runs with this Python)
         except ImportError: letters, why = None, 'no fontTools (pip install fonttools)'
@@ -609,11 +625,12 @@ class Port:
             nsp.rmtree(kf); d.mkdir(parents=True, exist_ok=True)
             nsp.run([PY, DM / 'tools/make_ext_font.py', ttf, letters], self.logs / 'make_ext_font.log', env=self.env)
             kf.write_text(f'{key}\n')
-        return [f'DM_SHARED_FONT_EXT={datapack.files_folder(self.package)}/nintendo_ext.ttf'], {'nintendo_ext.ttf': ttf}
+        return [f'DM_SHARED_FONT_EXT={root or datapack.files_folder(self.package)}/nintendo_ext.ttf'], {'nintendo_ext.ttf': ttf}
 
     # ---- install (optional) ----
     def install(self):
-        install.install(self.apk_path, self.data_path, self.tools['adb'], self.o.device or self.cfg.get('device'), replace_signer=self.o.replace_signer)
+        if self.o.single_apk: install.install_apk(self.apk_path, self.tools['adb'], self.o.device or self.cfg.get('device'), replace_signer=self.o.replace_signer)
+        else: install.install(self.apk_path, self.data_path, self.tools['adb'], self.o.device or self.cfg.get('device'), replace_signer=self.o.replace_signer)
 
 
 def emit_result(r):   # the last JSON event of a port (the GUI's done screen); a summary line in the other modes

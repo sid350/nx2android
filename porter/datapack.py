@@ -8,6 +8,7 @@
 #   settings.txt   the pause menu's first-launch defaults (the profile's setting rows, then the port's: --touch); the installer never replaces the player's own
 #   nx2a-data.json what the pack is: the game, the package, the version, the device features the profile requires (android.tsv requires), which the installer checks
 # Big trees are hard links into the extraction when the volume allows, so the pack takes no extra space; the pack is rebuilt whole when anything in it changes.
+# A --single-apk port puts the same files in the APK as assets/nx2a/ (mkapk.py --pack), which the app reads in place under PACK_ROOT (dm/host/packfs.h): its env.txt names that root.
 import json, os, shutil, time
 from pathlib import Path
 
@@ -32,12 +33,15 @@ def link_tree(src, dst):   # (files, bytes)
 
 
 def files_folder(package): return f'/sdcard/Android/data/{package}/files'
+PACK_ROOT = '/nx2a-apk'                     # where the app finds a --single-apk port's files (dm/host/packfs.h PACKFS_ROOT)
+APK_MANIFEST = f'assets/nx2a/{MANIFEST}'    # the manifest's entry in such an APK
 
 
-def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, language='en-US', package=None, env=(), settings=None, files=None, progress=None):
+def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, language='en-US', package=None, env=(), settings=None, files=None, progress=None, single_apk=False):
     """Write the pack to dst (replacing it). profile: the AndroidProfile; package: the app's, when not the profile's; env: more env.txt rows, after the profile's; settings: settings.txt values over the profile's;
-    files: {name in the pack: source} (the 60 fps memory writes, fpslock.tsv; the button-icon font). Returns the manifest"""
+    files: {name in the pack: source} (the 60 fps memory writes, fpslock.tsv; the button-icon font); single_apk: the pack goes into the APK (its paths are under PACK_ROOT). Returns the manifest"""
     package = package or profile.package
+    root = PACK_ROOT if single_apk else files_folder(package)
     tmp = dst.with_name(dst.name + '.partial')
     if tmp.exists(): shutil.rmtree(tmp)
     tmp.mkdir(parents=True)
@@ -50,12 +54,13 @@ def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, 
     for name, src in (files or {}).items(): shutil.copyfile(src, tmp / name); n += 1; b += Path(src).stat().st_size
     rows = [f'# Written by nx2android\'s porter for {profile.name} ({profile.id}); KEY=VALUE per line, read by the app at launch',
             f'DM_LANG={language}']
-    if aoc: rows.append(f'DM_AOC_DIR={files_folder(package)}/aoc')
+    if aoc: rows.append(f'DM_AOC_DIR={root}/aoc')
     rows += profile.env + list(env)
     (tmp / 'env.txt').write_text('\n'.join(rows) + '\n', encoding='utf-8', newline='\n')
     if sets := {**profile.settings, **(settings or {})}: (tmp / 'settings.txt').write_text(''.join(f'{k}={v}\n' for k, v in sets.items()), encoding='utf-8', newline='\n')
     man = dict(title_id=profile.id, name=profile.name, package=package, version=version, display=display, language=language, requires=profile.requires,
                files=n, bytes=b, dlc=sorted(int(p.name) for p in aoc.iterdir() if p.is_dir() and p.name.isdigit()) if aoc else [], made=time.strftime('%Y-%m-%d %H:%M:%S'))
+    if single_apk: man['single_apk'] = True
     (tmp / MANIFEST).write_text(json.dumps(man, indent=2), encoding='utf-8')
     if dst.exists(): shutil.rmtree(dst)
     for i in range(20):   # Windows: a folder just removed can stay delete-pending while another process (an indexer, a virus scan) holds it, and the rename is refused meanwhile
@@ -69,3 +74,10 @@ def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, 
 def read_manifest(d):
     try: return json.loads((Path(d) / MANIFEST).read_text(encoding='utf-8'))
     except (OSError, ValueError): return None
+
+
+def read_apk_manifest(apk):   # the manifest a --single-apk port carries in its APK; None for an APK beside a data pack
+    import zipfile
+    try:
+        with zipfile.ZipFile(apk) as z: return json.loads(z.read(APK_MANIFEST).decode('utf-8'))
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile): return None

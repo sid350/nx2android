@@ -4,6 +4,7 @@
 // geometry 2, tessellation 3 / 4; compute 0) by rewriting the DescriptorSet decorations, so a program's stages never collide.
 #include "gfx_vk.h"
 #include "nvn_hmap.h"
+#include "packfs.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <fcntl.h>
 #include <string.h>
@@ -14,12 +15,17 @@
 typedef struct __attribute__((packed)) { uint64_t key; uint32_t stage, spv_off, spv_len, refl_off, refl_len, pad; } bent;
 static const uint8_t *g_bundle; static uint32_t g_nent; static const bent *g_ent;
 void vk_shaders_open(const char *path) {
-    int fd = open(path, O_RDONLY | O_CLOEXEC); struct stat st;
-    if (fd < 0 || fstat(fd, &st)) { VKLOG("[RED] no shader bundle at %s: nothing will be drawn", path); if (fd >= 0) close(fd); return; }
-    g_bundle = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd);
-    if (g_bundle == MAP_FAILED || memcmp(g_bundle, "DMSV", 4)) { VKLOG("[RED] %s is not a shader bundle", path); g_bundle = NULL; return; }
+    // a --single-apk port's bundle is mapped straight from the app's APK (packfs.h): its data starts at a page-aligned offset there (mkapk.py --pack), rounded down anyway
+    int64_t base = 0, size = 0; struct stat st;
+    int fd = packfs_is(path) ? packfs_open(path, &base, &size) : open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || (!base && fstat(fd, &st))) { VKLOG("[RED] no shader bundle at %s: nothing will be drawn", path); if (fd >= 0) close(fd); return; }
+    if (!base) size = st.st_size;
+    int64_t lead = base & (int64_t)(sysconf(_SC_PAGESIZE) - 1);
+    const uint8_t *m = size >= 12 ? mmap(NULL, (size_t)(size + lead), PROT_READ, MAP_SHARED, fd, base - lead) : MAP_FAILED; close(fd);
+    g_bundle = m == MAP_FAILED ? NULL : m + lead;
+    if (!g_bundle || memcmp(g_bundle, "DMSV", 4)) { VKLOG("[RED] %s is not a shader bundle", path); g_bundle = NULL; return; }
     memcpy(&g_nent, g_bundle + 8, 4); g_ent = (const bent *)(g_bundle + 12);
-    VKLOG("shader bundle %s: %u shaders, %.1f MB", path, g_nent, st.st_size / 1048576.0);
+    VKLOG("shader bundle %s: %u shaders, %.1f MB", path, g_nent, size / 1048576.0);
 }
 static void bundle_open_once(void) {
     const char *p = getenv("DM_VK_SHADERS"); char buf[1024];

@@ -194,7 +194,7 @@ class PortTab(QWidget):
 
     def install_now(self):
         if not self.result: return
-        args = ['install', self.result['data'], '--apk', self.result['apk'], '--progress', 'json']
+        args = ['install', self.result['data'], '--apk', self.result['apk'], '--progress', 'json'] if self.result.get('data') else ['install', self.result['apk'], '--progress', 'json']   # a --single-apk port: the APK alone
         if self.device.currentData(): args += ['--device', self.device.currentData()]
         if self.replace_signer.isChecked(): args.append('--replace-signer')
         self.run(args)

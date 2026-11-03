@@ -1,6 +1,7 @@
 // System service interfaces used by games on newer SDKs (16.x): oe / time / pl (shared font) / vi vsync / diag.
 // On the real device all of these go through Horizon system services (IPC); the host gives values directly or makes them "unavailable".
 #include "hle.h"
+#include "packfs.h"
 #include <fcntl.h>
 #include <pthread.h>
 #include <pthread/qos.h>
@@ -61,12 +62,13 @@ HLE_FORCE("_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTask9GetResultEv", "n
 //   and the font engine then crashes on a wild pointer (SMBW main +0x107dbc0). Games that read the address as a TTF get it past the header (font_skip below).
 typedef struct { uint8_t *p; size_t n; } font_t;
 static font_t font_map(const char *p) {
-    font_t f = {0}; int fd = open(p, O_RDONLY); struct stat st;
-    if (fd < 0 || fstat(fd, &st)) { if (fd >= 0) close(fd); return f; }
-    size_t n = (size_t)st.st_size;
+    font_t f = {0}; int64_t base = 0, psize = 0; struct stat st;
+    int fd = packfs_is(p) ? packfs_open(p, &base, &psize) : open(p, O_RDONLY);   // a --single-apk port's font is in the app's APK (packfs.h): an fd of the APK, read at the font's offset
+    if (fd < 0 || (!base && fstat(fd, &st))) { if (fd >= 0) close(fd); return f; }
+    size_t n = base ? (size_t)psize : (size_t)st.st_size;
     uint8_t *m = mmap(NULL, n + 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (m == MAP_FAILED) { LOG("[RED] shared font memory allocation failed (%zu bytes)", n + 8); close(fd); return f; }
-    size_t got = 0; while (got < n) { ssize_t r = pread(fd, m + 8 + got, n - got, (off_t)got); if (r <= 0) break; got += (size_t)r; }
+    size_t got = 0; while (got < n) { ssize_t r = pread(fd, m + 8 + got, n - got, (off_t)(base + got)); if (r <= 0) break; got += (size_t)r; }
     close(fd);
     if (got != n) { LOG("[RED] shared font read short: %s (%zu / %zu bytes)", p, got, n); munmap(m, n + 8); return f; }
     uint32_t done = 0x18029a7fu, len = __builtin_bswap32((uint32_t)n ^ 0x49621806u);

@@ -2,7 +2,9 @@
 //   dmhost executable (adb shell): headless, the guest runs on the calling thread as on the Mac without DM_WINDOW; no window, no input, no text entry.
 //   libdmhost.so in the app (a NativeActivity, no Java): ANativeActivity_onCreate lays out the game's files in the app's external files folder
 //   (/sdcard/Android/data/<package>/files: mods/ = the rewritten modules, RomFS/, shaders.dmsv; env.txt = KEY=VALUE switches; log.txt = the log), keeps saves in
-//   internal storage, and starts the host on a thread of its own. The window goes to the Vulkan backend's swapchain (dm_front_window); game controllers
+//   internal storage, and starts the host on a thread of its own. A --single-apk port carries those files in the APK itself (assets/nx2a/), read in place (apkpack.c,
+//   dm/host/packfs.h): the files folder then keeps only what the app writes (the log, settings.txt and env.txt, caches, captured shaders, saves exported).
+//   The window goes to the Vulkan backend's swapchain (dm_front_window); game controllers
 //   (KEYCODE_BUTTON_*, sticks, triggers, hat) feed player 1's pad; touches go to the game's touch screen; shaking the device shakes player 1's controller;
 //   leaving and coming back pauses as on iOS.
 #include "dm.h"
@@ -10,6 +12,7 @@
 #include "dm_input.h"
 #include "overlay_layout.h"
 #include "saves_android.h"
+#include "packfs.h"
 #include <math.h>
 #include <time.h>
 #include <android/asset_manager.h>
@@ -50,6 +53,7 @@ static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a;
 void dm_focus_set(int st); void dm_audio_suspend(int on); void guest_clock_freeze_for(int reason, int on); void dm_gfx_suspend(int on);
 // ---- settings (the pause menu's), kept in the files folder as KEY=VALUE lines ----
 static char g_root[512];
+static char g_data[512];   // where the game's files are: g_root, or PACKFS_ROOT for a --single-apk port (the modules' folder below it is the host's argv[1])
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
 static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
 static _Atomic int g_set_grid;   // the layout editor's Snap to grid
@@ -839,7 +843,7 @@ static void on_queue_destroyed(ANativeActivity *a, AInputQueue *q) { (void)a; AI
 int main(int argc, char **argv);   // dm/host/main.c
 static void *host_thread(void *a) {
     (void)a;
-    char mods[600]; snprintf(mods, sizeof mods, "%s/mods", g_root);
+    char mods[600]; snprintf(mods, sizeof mods, "%s/mods", g_data);
     char *argv[] = {"dmhost", mods, NULL};
     atomic_store(&g_running, 1);
     int rc = main(2, argv);
@@ -856,6 +860,35 @@ static void env_file(const char *path) {   // KEY=VALUE per line (# comments): s
     }
     fclose(f);
 }
+// The app's own APK: Context.getPackageCodePath() (the .so is extracted, extractNativeLibs, so it is not mapped from the APK), else the base.apk in /proc/self/maps
+static int apk_path(ANativeActivity *a, char *out, size_t n) {
+    JNIEnv *E = a->env; jclass c = (*E)->GetObjectClass(E, a->clazz); jmethodID m = c ? (*E)->GetMethodID(E, c, "getPackageCodePath", "()Ljava/lang/String;") : NULL;
+    jstring s = !jx(E) && m ? (*E)->CallObjectMethod(E, a->clazz, m) : NULL; const char *u = !jx(E) && s ? (*E)->GetStringUTFChars(E, s, NULL) : NULL;
+    int ok = u && snprintf(out, n, "%s", u) < (int)n;
+    if (u) (*E)->ReleaseStringUTFChars(E, s, u);
+    if (s) (*E)->DeleteLocalRef(E, s);
+    if (c) (*E)->DeleteLocalRef(E, c);
+    if (ok) return 1;
+    FILE *f = fopen("/proc/self/maps", "r"); char line[1024];
+    while (f && fgets(line, sizeof line, f)) {
+        char *p = strchr(line, '/'), *e = p ? p + strcspn(p, "\n") : NULL;
+        if (e) *e = 0;
+        if (p && e - p > 9 && !strcmp(e - 9, "/base.apk") && snprintf(out, n, "%s", p) < (int)n) { ok = 1; break; }
+    }
+    if (f) fclose(f);
+    return ok;
+}
+// A --single-apk port's env.txt and settings.txt go to the files folder at the first start, where the player's edits and the pause menu's settings are kept from then on
+static void pack_first_copy(const char *name) {
+    char dst[600], tmp[610], src[64], b[4096]; snprintf(dst, sizeof dst, "%s/%s", g_root, name); snprintf(tmp, sizeof tmp, "%s.new", dst); snprintf(src, sizeof src, PACKFS_ROOT "/%s", name);
+    if (!access(dst, F_OK)) return;
+    FILE *in = packfs_fopen(src), *out = in ? fopen(tmp, "w") : NULL; size_t k; int bad = !out;
+    while (out && (k = fread(b, 1, sizeof b, in))) bad |= fwrite(b, 1, k, out) != k;
+    if (out) bad |= fclose(out) != 0;
+    if (in) fclose(in);
+    if (in && !bad && !rename(tmp, dst)) LOG("pack: %s copied to the files folder (first start)", name);
+    else if (in) { unlink(tmp); LOG("[RED] pack: cannot write %s (errno=%d)", dst, errno); }
+}
 __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActivity *act, void *saved, size_t saved_size) {
     (void)saved; (void)saved_size;
     g_act = act;
@@ -871,10 +904,14 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     if (!freopen(p, "w", stderr)) __android_log_print(ANDROID_LOG_ERROR, "dmhost", "cannot write %s", p);
     setvbuf(stderr, NULL, _IOLBF, 0);
     setenv("DM_ROOT", g_root, 1);
-    snprintf(p, sizeof p, "%s/RomFS", g_root); setenv("DM_ROMFS", p, 0);
+    // the game's files: in the APK for a --single-apk port (its own env.txt names the pack's DLC, font and 60 fps rows too), else in the files folder
+    { char apk[600]; int packed = apk_path(act, apk, sizeof apk) && packfs_init(apk) > 0;
+      snprintf(g_data, sizeof g_data, "%s", packed ? PACKFS_ROOT : g_root);
+      if (packed) { pack_first_copy("env.txt"); pack_first_copy("settings.txt"); } }
+    snprintf(p, sizeof p, "%s/RomFS", g_data); setenv("DM_ROMFS", p, 0);
     snprintf(p, sizeof p, "%s/save", act->internalDataPath); mkdir(p, 0700); setenv("DM_SAVE", p, 0);
     snprintf(p, sizeof p, "%s/temp", act->internalDataPath); mkdir(p, 0700); setenv("DM_TEMP", p, 0);
-    snprintf(p, sizeof p, "%s/shaders.dmsv", g_root); setenv("DM_VK_SHADERS", p, 0);
+    snprintf(p, sizeof p, "%s/shaders.dmsv", g_data); setenv("DM_VK_SHADERS", p, 0);
     snprintf(p, sizeof p, "%s/env.txt", g_root); env_file(p);
 #ifdef DM_RELEASE
     unsetenv("DM_CTL");   // a release build takes no remote key presses (the control file is a development tool)
@@ -883,7 +920,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
     settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble));
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
-    LOG("NX2A host on Android: files %s, saves %s", g_root, act->internalDataPath);
+    LOG("NX2A host on Android: files %s, saves %s%s%s", g_root, act->internalDataPath, packfs_on() ? ", game data in the APK as " : "", packfs_on() ? PACKFS_ROOT : "");
     pthread_t t; pthread_create(&t, NULL, input_thread, NULL); pthread_detach(t);
     // The game's main thread: a 16 MB stack mapped here and handed over whole (pthread_attr_setstack), so the range pthread_getattr_np reports, which
     // svcQueryMemory gives the game as its main thread stack (hle_svc.c), is exactly mapped memory: IL2CPP's garbage collector scans that range from

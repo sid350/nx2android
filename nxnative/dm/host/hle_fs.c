@@ -7,6 +7,7 @@
 #include "hle.h"
 #include <mach/mach.h>
 #include "front.h"
+#include "packfs.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -44,6 +45,26 @@ static void path_unlock(pthread_mutex_t **m) { pthread_mutex_unlock(*m); }
 #define PATH_LOCK() pthread_mutex_t *path_guard __attribute__((cleanup(path_unlock))) = &g_path_lock; pthread_mutex_lock(path_guard)
 static uint8_t g_fmode[65536];              // fd → open mode
 static uint8_t g_fsave[65536];              // fd → whether it is on a transactional save mount (the save write injection point only counts these)
+// fd → the file's place in the APK, for a file of a --single-apk port's pack (packfs.h): the fd is the APK's, reads go to base + offset and stop at size. base 0 = a host file
+// (a zip entry's data never starts at 0); made at the first open of a pack file, so a host without a pack never has it
+typedef struct { int64_t base, size; } fpack_t;
+static fpack_t *g_fpack;
+static const fpack_t *fpack(int fd) { return g_fpack && fd >= 0 && fd < 65536 && g_fpack[fd].base ? &g_fpack[fd] : NULL; }
+static ssize_t fs_pread(int fd, void *buf, size_t n, int64_t off) {   // pread(2), within the file's bytes for a pack file
+    const fpack_t *p = fpack(fd);
+    if (!p) return pread(fd, buf, n, off);
+    if (off < 0) { errno = EINVAL; return -1; }
+    if (off >= p->size) return 0;
+    if ((int64_t)n > p->size - off) n = (size_t)(p->size - off);
+    return pread(fd, buf, n, p->base + off);
+}
+// Existence and type of a host path or a pack path (the pack is the read-only mounts' only other source): access / stat as before for a host path
+static int fs_exists(const char *p) { return packfs_is(p) ? !packfs_stat(p, NULL, NULL) : !access(p, F_OK); }
+static int fs_stat(const char *p, int *isdir, int64_t *size) {
+    if (packfs_is(p)) return packfs_stat(p, isdir, size);
+    struct stat st; if (stat(p, &st)) return -1;
+    *isdir = S_ISDIR(st.st_mode); *size = S_ISDIR(st.st_mode) ? 0 : st.st_size; return 0;
+}
 static _Atomic int g_save_writes;           // number of writes on the save mount (shared by the injection point and the commit log)
 static _Atomic uint64_t g_txn_first_ns;     // time of this transaction's first save write (used by the commit log to report timing; cleared to 0 at commit)
 // Write failures are refused per transaction: on the real device save space is reserved when the save is created, overwrites cannot fail, and the game does not check the return values of WriteFile / SetFileSize either, it Commits as usual after a failure
@@ -113,7 +134,7 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     if (!ro && !txn) mkdir(dir, 0755);
     LOG("fs mount %s: → %s%s%s", name, txn ? g_mnt[g_nmnt - 1].dir : dir, ro || txn_err ? " (read-only)" : txn ? " (transactional save: work directory, swapped in atomically on Commit)" : "", g_mnt[g_nmnt - 1].overlay[0] ? " (overlay first)" : "");
     // A read-only mount the host may not list: every lookup in it fails with EACCES and the game sees no files at all (issue #9: Mario vs. Donkey Kong then dereferenced a null at its first heap setup, which read as a crash of its own)
-    if (ro && !txn) { DIR *d = opendir(dir); int e = errno; struct stat st;
+    if (ro && !txn && !packfs_is(dir)) { DIR *d = opendir(dir); int e = errno; struct stat st;   // (the pack, packfs.h, is always listable)
         if (d) closedir(d);
         else if (e == ENOENT) ;   // a game with no RomFS of its own, or a stand-in that is not there: lookups answer "not found" as they should
         else if (!stat(dir, &st))
@@ -179,6 +200,13 @@ static const dir_index *dir_index_get(const char *dir) {
     return x;
 }
 static int path_component(char *parent, size_t n, const char *name, int create, int ro) {
+    if (packfs_is(parent)) {   // a --single-apk port's data in the APK (packfs.h): its own index answers, by exact name as the directory index below; nothing is ever created there
+        size_t len = strlen(parent), k = strlen(name);
+        if (len + k + 2 > n) { errno = ENAMETOOLONG; return 0; }
+        parent[len] = '/'; memcpy(parent + len + 1, name, k + 1);
+        if (!create && packfs_stat(parent, NULL, NULL)) { parent[len] = 0; return 0; }
+        return 1;
+    }
     if (ro && !create) {
         const dir_index *x = dir_index_get(parent);
         if (x) {
@@ -244,11 +272,11 @@ static int rom_overlay_path(const mount_t *m, const char *rest, char *out, size_
     char *save = NULL;
     for (char *root = strtok_r(roots, ":", &save); root; root = strtok_r(NULL, ":", &save)) {
         char candidate[1024];
-        if (root_path(root, rest, candidate, sizeof candidate) && !access(candidate, F_OK)) {
+        if (root_path(root, rest, candidate, sizeof candidate) && fs_exists(candidate)) {
             strlcpy(out, candidate, n); free(roots); return 1;
         }
     }
-    int found = root_path(m->dir, rest, out, n) && !access(out, F_OK);
+    int found = root_path(m->dir, rest, out, n) && fs_exists(out);
     free(roots);
     if (found) return 1;
     errno = ENOENT; return 0;
@@ -325,7 +353,7 @@ static Result err_res(const char *op, const char *path) {
 #define HP(path) HP_EX(path, 0)
 #define RW() if (ro) { LOG("fs write to a read-only mount: %s", hp); return RES_FAIL; }
 // Create directory / create file: if the target exists, answer "already exists" as a writable mount would -- that is the only failure the game understands (the original save storage never fails to write); with a generic failure it carries on with a null handle
-#define RW_CREATE() if (ro) { if (!access(hp, F_OK)) return RES_PATH_EXISTS; LOG("fs write to a read-only mount: %s", hp); return RES_FAIL; }
+#define RW_CREATE() if (ro) { if (fs_exists(hp)) return RES_PATH_EXISTS; LOG("fs write to a read-only mount: %s", hp); return RES_FAIL; }
 
 // ---------- Mount ----------
 HLE_FORCE("_ZN2nn2fs22QueryMountRomCacheSizeEPm", "fsp-srv; rom reads the host directory directly, the cache gets only the minimum size", Result, h_fs_QueryRomCache, size_t *out) { *out = 0x1000; return RES_OK; }
@@ -353,7 +381,19 @@ static size_t romfs_buckets(size_t n) {   // the hash table size of the RomFS bu
     return n;
 }
 static void romfs_tables(const char *dir, size_t *ndir, size_t *dbytes, size_t *nfile, size_t *fbytes, int depth) {
-    DIR *d = opendir(dir); struct dirent *e; char hp[1280], g[256];
+    char hp[1280], g[256];
+    if (packfs_is(dir)) {   // add-on content in a --single-apk port's pack (packfs.h): the same walk over the pack's listing
+        const packfs_ent *pe; int np = packfs_dir(dir, &pe);
+        for (int i = 0; i < np; i++) {
+            size_t name = (strlen(pe[i].name) + 3) & ~(size_t)3;
+            if (pe[i].isdir) {
+                ++*ndir; *dbytes += 0x18 + name;
+                if (depth < 64 && snprintf(hp, sizeof hp, "%s/%s", dir, pe[i].name) < (int)sizeof hp) romfs_tables(hp, ndir, dbytes, nfile, fbytes, depth + 1);
+            } else { ++*nfile; *fbytes += 0x20 + name; }
+        }
+        return;
+    }
+    DIR *d = opendir(dir); struct dirent *e;
     if (!d) return;
     while ((e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || !guest_name(dir, e->d_name, g, sizeof g)) continue;
@@ -371,8 +411,8 @@ static size_t romfs_work_size(const char *dir) {
     return 4 * romfs_buckets(ndir) + dbytes + 4 * romfs_buckets(nfile) + fbytes;
 }
 static int aoc_dir(char *dir, size_t n, int index) {
-    const char *base = getenv("DM_AOC_DIR"); struct stat st;
-    return base && *base && snprintf(dir, n, "%s/%d", base, index) < (int)n && !stat(dir, &st) && S_ISDIR(st.st_mode);
+    const char *base = getenv("DM_AOC_DIR"); int isdir = 0; int64_t sz;
+    return base && *base && snprintf(dir, n, "%s/%d", base, index) < (int)n && !fs_stat(dir, &isdir, &sz) && isdir;
 }
 HLE_FORCE("_ZN2nn2fs31QueryMountAddOnContentCacheSizeEPmi", "fsp-srv; add-on content reads the host directory directly, the cache is the size of its RomFS file table", Result, h_fs_QueryAocCache, size_t *out, int index) {
     char dir[1024];
@@ -604,11 +644,18 @@ HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; the mount table is permanent, unmou
 HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) {
     HP(path);
     if (mode & (MODE_WRITE | MODE_APPEND)) RW();
-    int fd = open(hp, (mode & (MODE_WRITE | MODE_APPEND)) ? ((mode & MODE_READ) ? O_RDWR : O_WRONLY) : O_RDONLY);
-    if (fd < 0) return err_res("open", hp);
-    struct stat st; fstat(fd, &st);
-    if (S_ISDIR(st.st_mode)) { close(fd); return RES_PATH_NOT_FOUND; }
+    int64_t pbase = 0, psize = 0; int fd;
+    if (packfs_is(hp)) {   // a --single-apk port: an fd of the APK and the file's place in it (packfs.h); a directory answers not found, as below
+        if ((fd = packfs_open(hp, &pbase, &psize)) < 0) return errno == EISDIR ? RES_PATH_NOT_FOUND : err_res("open", hp);
+    } else {
+        fd = open(hp, (mode & (MODE_WRITE | MODE_APPEND)) ? ((mode & MODE_READ) ? O_RDWR : O_WRONLY) : O_RDONLY);
+        if (fd < 0) return err_res("open", hp);
+        struct stat st; fstat(fd, &st);
+        if (S_ISDIR(st.st_mode)) { close(fd); return RES_PATH_NOT_FOUND; }
+    }
     if (fd >= (int)sizeof g_fmode) die("fd beyond the table");
+    if (pbase && !g_fpack && !(g_fpack = calloc(65536, sizeof *g_fpack))) die("pack file table allocation failed");
+    if (g_fpack) g_fpack[fd] = (fpack_t){pbase, psize};
     g_fmode[fd] = (uint8_t)mode; *out = (uint64_t)fd;
     { const char *c = strchr(path, ':'); size_t ln = c ? (size_t)(c - path) : 0; g_fsave[fd] = 0;
       for (int i = 0; c && i < g_nmnt; i++) if (strlen(g_mnt[i].name) == ln && !strncmp(g_mnt[i].name, path, ln)) g_fsave[fd] = g_mnt[i].commit[0] != 0; }
@@ -622,7 +669,7 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
     size_t got = 0; int reprep = 0;
     dm_guest_write_prepare(buf, sz);   // The destination may be a texture pool page write-protected by the graphics layer: a kernel write to a read-only page returns EFAULT instead of page-faulting, so unprotect and mark dirty first
     while (got < sz) {
-        ssize_t r = pread((int)h, (uint8_t *)buf + got, sz - got, off + got);
+        ssize_t r = fs_pread((int)h, (uint8_t *)buf + got, sz - got, off + got);
         if (r < 0) { if (errno == EINTR) continue;
             // The graphics layer write-protects tracked pages again after each upload (nvn_dirty.c), so a page made writable above can be read-only again by the time pread
             // writes it: a plain write would fault into the tracker's handler, a system call gets EFAULT. Prepare the rest again (unprotect, mark dirty) and read on. Monster Train 2
@@ -678,6 +725,7 @@ HLE_FORCE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "fsp
 }
 HLE_FORCE("_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", "fsp-srv → fstat(2)", Result, h_fs_GetFileSize, int64_t *out, uint64_t h) {
     if (!h) return RES_FAIL;
+    const fpack_t *p = fpack((int)h); if (p) { *out = p->size; return RES_OK; }   // a pack file: its own size, not the APK's
     struct stat st; if (fstat((int)h, &st)) return err_res("fstat", "fd");
     *out = st.st_size; return RES_OK;
 }
@@ -690,7 +738,7 @@ HLE_FORCE("_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", "fsp-srv → ftruncate(2)
 HLE_FORCE("_ZN2nn2fs9FlushFileENS0_10FileHandleE", "fsp-srv; host writes are already in the page cache, flushing is a no-op", Result, h_fs_FlushFile, uint64_t h) { (void)h; return RES_OK; }
 HLE_FORCE("_ZN2nn2fs9CloseFileENS0_10FileHandleE", "fsp-srv → close(2)", void, h_fs_CloseFile, uint64_t h) {
     if (!h) return;   // the null handle after a failed open (see ReadFile): do not touch fd 0
-    g_fmode[(int)h & 0xffff] = 0; g_fsave[(int)h & 0xffff] = 0;
+    g_fmode[(int)h & 0xffff] = 0; g_fsave[(int)h & 0xffff] = 0; if (g_fpack) g_fpack[(int)h & 0xffff] = (fpack_t){0, 0};
     close((int)h); }
 HLE_FORCE("_ZN2nn2fs15GetFileOpenModeENS0_10FileHandleE", "fsp-srv; the open mode is recorded by the host", int, h_fs_GetFileOpenMode, uint64_t h) { return g_fmode[(int)h & 0xffff]; }
 
@@ -763,13 +811,14 @@ HLE_FORCE("_ZN2nn2fs10RenameFileEPKcS2_", "fsp-srv → rename(2)", Result, h_fs_
 // The Great Ace Attorney Chronicles (SDK 10) imports it; a directory carries its guest name the same way as a file
 HLE_FORCE("_ZN2nn2fs15RenameDirectoryEPKcS2_", "fsp-srv → rename(2) of a directory", Result, h_fs_RenameDir, const char *from, const char *to) { return rename_entry(from, to); }
 HLE_FORCE("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", "fsp-srv → stat(2)", Result, h_fs_GetEntryType, int32_t *out, const char *path) {
-    HP(path); struct stat st;
-    if (stat(hp, &st)) return err_res("stat", hp);
-    *out = S_ISDIR(st.st_mode) ? ENT_DIR : ENT_FILE; return RES_OK;
+    HP(path); int isdir; int64_t sz;
+    if (fs_stat(hp, &isdir, &sz)) return err_res("stat", hp);
+    *out = isdir ? ENT_DIR : ENT_FILE; return RES_OK;
 }
 
 // ---------- Directories ----------
-typedef struct { DIR *d; char path[1024]; DIR *od; char opath[1024]; DirectoryEntry *snap; int64_t nsnap, psnap; int mode; } dirh_t;
+// pk: a directory of a --single-apk port's pack (packfs.h), listed from the pack's resident index (d is NULL then)
+typedef struct { DIR *d; char path[1024]; DIR *od; char opath[1024]; DirectoryEntry *snap; int64_t nsnap, psnap; int mode; const packfs_ent *pk; int64_t npk, ppk; } dirh_t;
 static void dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
     char *roots = strdup(m->overlay);
     char (*names)[0x301] = calloc(2048, sizeof *names);
@@ -782,6 +831,14 @@ static void dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
     for (char *root = strtok_r(roots, ":", &save); root && nr < 65; root = strtok_r(NULL, ":", &save)) all[nr++] = root;
     for (int ri = nr - 1; ri >= 0; ri--) {
         if (!root_path(all[ri], rest, parent, 1024)) continue;
+        if (packfs_is(parent)) {   // the base RomFS in a --single-apk port's pack, overlays on the host (or the other way round)
+            const packfs_ent *pe; int np = packfs_dir(parent, &pe);
+            for (int k = 0; k < np; k++) {
+                int dup = 0; for (int j = 0; j < nn; j++) if (!strcmp(names[j], pe[k].name)) { dup = 1; break; }
+                if (!dup && nn < 2048) strlcpy(names[nn++], pe[k].name, sizeof names[0]);
+            }
+            continue;
+        }
         DIR *x = opendir(parent); if (!x) continue;
         struct dirent *e;
         while ((e = readdir(x))) {
@@ -792,21 +849,22 @@ static void dir_snapshot(dirh_t *h, const mount_t *m, const char *rest) {
         }
         closedir(x);
     }
-    h->snap = calloc(nn, sizeof *h->snap); h->nsnap = nn;
+    h->snap = calloc(nn ? nn : 1, sizeof *h->snap); h->nsnap = nn;   // never NULL: ReadDirectory tells a snapshot by its pointer
     if (nn && !h->snap) die("rom overlay directory snapshot allocation failed");
     for (int j = 0; j < nn; j++) {
         strlcpy(h->snap[j].name, names[j], sizeof h->snap[j].name);
         snprintf(rel, 2048, "%s/%s", rest, names[j]);
         if (!rom_overlay_path(m, rel, resolved, 1024)) continue;
-        struct stat st;
-        if (!stat(resolved, &st)) { h->snap[j].type = S_ISDIR(st.st_mode) ? ENT_DIR : ENT_FILE; h->snap[j].size = S_ISDIR(st.st_mode) ? 0 : st.st_size; }
+        int isdir; int64_t sz;
+        if (!fs_stat(resolved, &isdir, &sz)) { h->snap[j].type = isdir ? ENT_DIR : ENT_FILE; h->snap[j].size = sz; }
     }
     free(resolved); free(rel); free(guest); free(parent); free(all); free(names); free(roots);
 }
 HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → opendir(3)", Result, h_fs_OpenDirectory, uint64_t *out, const char *path, int mode) {
-    HP(path); DIR *d = opendir(hp);
-    if (!d) return err_res("opendir", hp);
-    dirh_t *h = calloc(1, sizeof *h); h->d = d; strlcpy(h->path, hp, sizeof h->path); h->mode = mode;
+    HP(path); const packfs_ent *pk = NULL; int npk = 0; DIR *d = NULL;
+    if (packfs_is(hp)) { if ((npk = packfs_dir(hp, &pk)) < 0) return err_res("opendir", hp); }   // a directory of a --single-apk port's pack (packfs.h)
+    else if (!(d = opendir(hp))) return err_res("opendir", hp);
+    dirh_t *h = calloc(1, sizeof *h); h->d = d; strlcpy(h->path, hp, sizeof h->path); h->mode = mode; h->pk = pk; h->npk = npk;
     const char *c = strchr(path, ':');
     if (c) for (int i = 0; i < g_nmnt; i++) if (g_mnt[i].overlay[0] && strlen(g_mnt[i].name) == (size_t)(c - path) && !strncmp(g_mnt[i].name, path, (size_t)(c - path))) {
         dir_snapshot(h, &g_mnt[i], c + 1); break;
@@ -817,6 +875,11 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
     if (!hh) { *count = 0; return RES_FAIL; }
     PATH_LOCK(); dirh_t *h = (dirh_t *)hh; int64_t n = 0; struct dirent *e;
     if (h->snap) { while (n < max && h->psnap < h->nsnap) { DirectoryEntry *src = &h->snap[h->psnap++]; if (!(h->mode & (src->type == ENT_DIR ? DIRMODE_DIR : DIRMODE_FILE))) continue; ents[n++] = *src; } *count = n; return RES_OK; }
+    if (!h->d) {   // a pack directory: its entries in name order, types and sizes from the index
+        while (n < max && h->ppk < h->npk) { const packfs_ent *src = &h->pk[h->ppk++]; if (!(h->mode & (src->isdir ? DIRMODE_DIR : DIRMODE_FILE))) continue;
+            DirectoryEntry *o = &ents[n++]; memset(o, 0, sizeof *o); strlcpy(o->name, src->name, sizeof o->name); o->type = src->isdir ? ENT_DIR : ENT_FILE; o->size = src->size; }
+        *count = n; return RES_OK;
+    }
     int dfd = dirfd(h->d);
     while (n < max && (e = readdir(h->d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
@@ -833,7 +896,7 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
 }
 HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → closedir(3)", void, h_fs_CloseDirectory, uint64_t hh) {
     if (!hh) return;   // the game also closes after a failed open (handle 0): nothing to do in the original either
-    dirh_t *h = (dirh_t *)hh; closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h);
+    dirh_t *h = (dirh_t *)hh; if (h->d) closedir(h->d); if (h->od) closedir(h->od); free(h->snap); free(h);
 }
 
 // ---------- Overloads from newer SDKs (SDK 16: MountRom without a cache, ReadFile without the bytes-read output / with read options, directory entry count) ----------
@@ -850,6 +913,7 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvmRKNS0_10ReadOptionE", "fsp-
 HLE_FORCE("_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", "fsp-srv; directory entry count (filtered by the mode given at open, read position untouched)", Result, h_fs_DirCount, int64_t *out, uint64_t hh) {
     PATH_LOCK(); dirh_t *h = (dirh_t *)hh; int64_t n = 0;
     if (h->snap) { for (int64_t i = 0; i < h->nsnap; i++) if (h->mode & (h->snap[i].type == ENT_DIR ? DIRMODE_DIR : DIRMODE_FILE)) n++; *out = n; return RES_OK; }
+    if (!h->d) { for (int64_t i = 0; i < h->npk; i++) if (h->mode & (h->pk[i].isdir ? DIRMODE_DIR : DIRMODE_FILE)) n++; *out = n; return RES_OK; }   // a pack directory
     DIR *d = opendir(h->path); if (!d) return err_res("opendir", h->path);
     struct dirent *e;
     while ((e = readdir(d))) {

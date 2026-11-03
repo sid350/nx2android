@@ -9,6 +9,8 @@
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 #include "hle.h"
+#include "packfs.h"
+#include <errno.h>
 
 module_t g_mod[MAX_MOD];
 int g_nmod;
@@ -211,7 +213,7 @@ static void force_check(void) {
 // Read the rewriter table header (segment boundaries, slot numbers); any row beyond the header means an old-format build output (code modified at load time), which is rejected
 static void read_layout(module_t *m, const char *dir) {
     char path[1024]; snprintf(path, sizeof path, "%s/%s.fixups.tsv", dir, m->name);
-    FILE *f = fopen(path, "r");
+    FILE *f = packfs_fopen_r(path);   // (the modules' folder may be in the app's APK: packfs.h)
     if (!f) die("open %s", path);
     static const char *kn[KEY_N] = {"K18", "KTLS", "KTLR", "KGATE"};
     char line[256], key[32], target[16] = "apple"; unsigned long v; unsigned seen = 0;   // an output without TARGET predates the Android port: Apple
@@ -284,7 +286,7 @@ static void install_key_page(module_t *m) {
 
 static void register_gates(module_t *m, const char *dir) {
     char path[1024], line[256]; snprintf(path, sizeof path, "%s/%s.gates.tsv", dir, m->name);
-    FILE *f = fopen(path, "r");
+    FILE *f = packfs_fopen_r(path);
     int ng = 0;
     if (f) {
         unsigned long ret, orig; char kind[16]; int arg;
@@ -387,7 +389,7 @@ static void preload_nros(const char *dir) {
     char path[1024], line[512]; snprintf(path, sizeof path, "%s/nro.tsv", dir);
     const char *off = getenv("DM_NRO");
     if (off && !atoi(off)) { LOG("NRO: loading off (DM_NRO=0): every LoadModule fails"); return; }
-    FILE *f = fopen(path, "r");
+    FILE *f = packfs_fopen_r(path);
     if (!f) return;
     int n0 = g_nmod; size_t data = 0;
     while (fgets(line, sizeof line, f)) {
@@ -556,6 +558,13 @@ static void map_image(module_t *m, const char *dir) {
 }
 #else
 static uint8_t *slurp(const char *path, size_t *n) {
+    if (packfs_is(path)) {   // a --single-apk port: the module is read from the APK (packfs.h)
+        int64_t base, size; int fd = packfs_open(path, &base, &size);
+        if (fd < 0) die("open %s (in the app's APK)", path);
+        uint8_t *p = malloc(size ? (size_t)size : 1);
+        for (int64_t got = 0; got < size;) { ssize_t r = pread(fd, p + got, (size_t)(size - got), base + got); if (r < 0 && errno == EINTR) continue; if (r <= 0) die("read %s (in the app's APK)", path); got += r; }
+        close(fd); *n = (size_t)size; return p;
+    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) die("open %s", path);
     struct stat st; fstat(fd, &st);

@@ -101,7 +101,10 @@ class Adb:
     # ---- install ----
     def install(self, apk, package, replace_signer=False):
         """adb install -r. A package installed with another signing key cannot be updated: replace_signer uninstalls it first (its saves in internal storage go with it)"""
-        try: self.run('install', '-r', apk, timeout=600, retries=1)
+        try: big = os.path.getsize(apk) // (4 << 20)   # a --single-apk port's APK holds the game: gigabytes take minutes over USB 2
+        except OSError: big = 0
+        timeout = max(600, big)
+        try: self.run('install', '-r', apk, timeout=timeout, retries=1)
         except AdbError as e:
             if 'INSTALL_FAILED_VERSION_DOWNGRADE' in str(e):   # Android installs over the same versionCode, never over a higher one
                 have = self.version_code(package)
@@ -114,7 +117,7 @@ class Adb:
                                'uninstall it on the device, or install with --replace-signer (its saves are deleted with it)') from e
             self.log(f'{package} has another signing key: uninstalling it first')
             self.run('uninstall', package, timeout=300, retries=1)
-            self.run('install', apk, timeout=600, retries=1)
+            self.run('install', apk, timeout=timeout, retries=1)
 
     def prepare_app_files(self, package, timeout=30):
         """Have Android create the app's files folder (/sdcard/Android/data/<package>/files) before anything is pushed into it: the system makes it, owned by the app with

@@ -1,6 +1,7 @@
 // Miscellaneous service layer: add-on content / shop / error applet / profanity filter / server name resolution / parental controls / software keyboard.
 // On the real device each goes through IPC or a system applet; the host gives results as single-player offline. Pure-computation SDK parts (hash, util, software Opus) are not taken over, the original implementation is used directly.
 #include "hle.h"
+#include "packfs.h"
 #include <dirent.h>
 
 // ---------- aoc add-on content (the DLC NSPs in the player's folder) / ec shop (excluded) ----------
@@ -17,10 +18,13 @@ static void aoc_load(void) {
     const char *e = getenv("DM_AOC_OWNED"), *dir = getenv("DM_AOC_DIR"); const char *why = "no DM_AOC_DIR";
     if (e && !strcmp(e, "0")) why = "DM_AOC_OWNED=0";
     else if (dir && *dir) {
-        why = dir; DIR *d = opendir(dir); struct dirent *ent;
-        while (d && (ent = readdir(d)) && g_naoc < (int)(sizeof g_aoc / sizeof *g_aoc)) {
-            char *end; long i = strtol(ent->d_name, &end, 10);
-            if (ent->d_name[0] >= '1' && ent->d_name[0] <= '9' && !*end && i <= 2000) g_aoc[g_naoc++] = (int)i;
+        why = dir; const packfs_ent *pe = NULL; int np = packfs_is(dir) ? packfs_dir(dir, &pe) : -1;   // the DLC in a --single-apk port's pack (packfs.h), else the folder
+        DIR *d = pe ? NULL : opendir(dir); struct dirent *ent;
+        for (int k = 0; g_naoc < (int)(sizeof g_aoc / sizeof *g_aoc); k++) {
+            const char *nm = pe ? (k < np ? pe[k].name : NULL) : d && (ent = readdir(d)) ? ent->d_name : NULL;
+            if (!nm) break;
+            char *end; long i = strtol(nm, &end, 10);
+            if (nm[0] >= '1' && nm[0] <= '9' && !*end && i <= 2000) g_aoc[g_naoc++] = (int)i;
         }
         if (d) closedir(d);
         qsort(g_aoc, g_naoc, sizeof *g_aoc, aoc_int_cmp);

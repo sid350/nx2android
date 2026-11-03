@@ -34,9 +34,13 @@ def _parser():
                     help='GB (0-48) of extra guest address space (the alias region) for a game with virtual address memory, for a game whose log shows '
                          '"AllocateAddressRegion refused (0x1803)" before it crashes; it uses no memory (default: 8 for a game version the profile was not '
                          'brought up on, none for one it was)')
+    po.add_argument('--single-apk', action='store_true',
+                    help='put the game\'s data in the APK (assets/nx2a/, stored and read in place by the app, nothing extracted): one APK to install by tapping it, no data pack '
+                         'to push; the APK must stay under 4 GiB, and the device holds the game once, inside the installed app')
     po.add_argument('--jobs', type=int, default=os.cpu_count() or 8)
     po.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'), help='json: one JSON event per line, for the GUI')
-    ins = sub.add_parser('install', help='install a port made earlier'); ins.add_argument('data', help='the data pack folder (<App>-data)'); ins.add_argument('--apk', help='the APK (default: <App>.apk beside the pack)')
+    ins = sub.add_parser('install', help='install a port made earlier'); ins.add_argument('data', help='the data pack folder (<App>-data), or the APK of a --single-apk port (installed alone)')
+    ins.add_argument('--apk', help='the APK (default: <App>.apk beside the pack)')
     ins.add_argument('--device', default=''); ins.add_argument('--replace-signer', action='store_true'); ins.add_argument('--progress', default='auto', choices=('auto', 'bar', 'lines', 'json', 'off'))
     dv = sub.add_parser('devices', help='the devices adb sees'); dv.add_argument('--json', action='store_true')
     t = sub.add_parser('tools', help='list, or download, the missing tools (Android NDK, .NET SDK, platform-tools) from Google and Microsoft')
@@ -127,7 +131,7 @@ def cmd_port(a):
         except ValueError: print(f'NX2A_VERCODE_OFFSET is not a number: {env}', file=sys.stderr); return 2
     opts = pipeline.Options(folder=Path(a.folder), keys=Path(a.keys) if a.keys else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
                             app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, touch=a.touch,
-                            vercode_offset=offset, alias_headroom=a.alias_headroom, jobs=a.jobs)
+                            vercode_offset=offset, alias_headroom=a.alias_headroom, single_apk=a.single_apk, jobs=a.jobs)
     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))
 
 
@@ -139,7 +143,8 @@ def cmd_install(a):
         apk = Path(a.apk) if a.apk else data.with_name(data.name.removesuffix('-data') + '.apk')
         PROG.plan(1)
         cfg = config.load()
-        install.install(apk, data, toolchain.find_adb(cfg), a.device or cfg.get('device'), replace_signer=a.replace_signer)
+        if data.is_file() and data.suffix.lower() == '.apk': install.install_apk(data, toolchain.find_adb(cfg), a.device or cfg.get('device'), replace_signer=a.replace_signer)   # a --single-apk port
+        else: install.install(apk, data, toolchain.find_adb(cfg), a.device or cfg.get('device'), replace_signer=a.replace_signer)
     return _with_progress(a.progress, go)
 
 

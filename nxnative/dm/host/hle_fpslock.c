@@ -3,6 +3,7 @@
 // (hle_nvn.c); the game sets the values after boot and may set them again, so each is written whenever it differs. Fixed addresses: each row runs only on the main build it was found in (AGENTS.md).
 // A port can also bring rows of its own from a FPSLocker config of its main build (DM_FPS_LOCKS, "Imported rows" below)
 #include "hle.h"
+#include "packfs.h"
 #include <mach/mach.h>
 
 // What a field holds: the frame rate as a float, vsyncs per frame (60 / frame rate) as an int32, or the frame time in milliseconds or seconds as a float. Copies: consecutive copies of the value
@@ -93,7 +94,7 @@ static int imp_values(char *s, int t, uint64_t *out) {   // "1,1": the copies; t
 }
 static void imp_load(const char *build) {
     const char *path = getenv("DM_FPS_LOCKS"); if (!path || !*path) return;
-    FILE *f = fopen(path, "r"); if (!f) { LOG("[RED] DM_FPS_LOCKS=%s: cannot open it; the game keeps its frame limit", path); return; }
+    FILE *f = packfs_fopen_r(path); if (!f) { LOG("[RED] DM_FPS_LOCKS=%s: cannot open it; the game keeps its frame limit", path); return; }   // (in the app's APK for a --single-apk port: packfs.h)
     char line[1024]; int ln = 0, ok = 0;
     while (fgets(line, sizeof line, f)) {
         ln++; line[strcspn(line, "\r\n")] = 0;

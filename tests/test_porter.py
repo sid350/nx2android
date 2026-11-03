@@ -115,6 +115,36 @@ class AndroidProfiles(unittest.TestCase):
         finally:
             shutil.rmtree(t, ignore_errors=True)
 
+    def test_apk_pack(self):   # mkapk.py --pack (--single-apk): the pack as assets/nx2a/, every entry stored at a 16 KB aligned offset, the v2 signature over the whole file
+        t = Path(tempfile.mkdtemp(prefix='nx2a_test_apkpack_'))
+        try:
+            so = t / 'libdmhost.so'; so.write_bytes(b'\x7fELF' + b'\0' * 60)
+            d = t / 'pack'; (d / 'RomFS/Data').mkdir(parents=True); (d / 'RomFS/empty').mkdir(); (d / 'mods').mkdir()
+            big = random.Random(7).randbytes(3 << 20)   # several 1 MB chunks for the streaming copy and the signature
+            (d / 'shaders.dmsv').write_bytes(big); (d / 'RomFS/Data/\u65e5\u672c.bin').write_bytes(b'kanji'); (d / 'RomFS/zero.bin').write_bytes(b''); (d / 'mods/main.fixups.tsv').write_text('# x 1\n')
+            import subprocess, zipfile
+            subprocess.run([sys.executable, str(REPO / 'nxnative/dm/android/apk/mkapk.py'), str(so), str(t / 'a.apk'), str(t / 'k.json'), '--lib', 'dmhost', '--pack', str(d)],
+                           check=True, capture_output=True)
+            raw = (t / 'a.apk').read_bytes()
+            with zipfile.ZipFile(t / 'a.apk') as z:
+                pk = {i.filename: i for i in z.infolist() if i.filename.startswith('assets/nx2a/')}
+                self.assertEqual(sorted(pk), ['assets/nx2a/RomFS/Data/\u65e5\u672c.bin', 'assets/nx2a/RomFS/empty/', 'assets/nx2a/RomFS/zero.bin', 'assets/nx2a/mods/main.fixups.tsv',
+                                              'assets/nx2a/shaders.dmsv'])
+                self.assertEqual(z.read('assets/nx2a/shaders.dmsv'), big); self.assertIsNone(z.testzip())   # the CRCs written after the copy
+                for i in pk.values():
+                    self.assertEqual(i.compress_type, zipfile.ZIP_STORED, i.filename)
+                    n, e = struct.unpack_from('<HH', raw, i.header_offset + 26); data = i.header_offset + 30 + n + e
+                    self.assertEqual(data % 16384, 0, i.filename)   # the host maps shaders.dmsv straight from the APK (apkpack.c checks it too)
+                    self.assertEqual(raw[data:data + i.file_size], z.read(i.filename))   # the bytes the host reads at that offset
+            # APK Signature Scheme v2: the digest it signs is the one of the entries, the central directory and the EOCD (pointing at the central directory) as written
+            eocd = raw.rindex(b'PK\x05\x06'); cd_off = struct.unpack_from('<I', raw, eocd + 16)[0]
+            size = struct.unpack_from('<Q', raw, cd_off - 24)[0]; self.assertEqual(raw[cd_off - 16:cd_off], b'APK Sig Block 42')
+            block = cd_off - size - 8; secs = [raw[:block], raw[cd_off:eocd], raw[eocd:eocd + 16] + struct.pack('<I', block) + raw[eocd + 20:]]
+            dig = [hashlib.sha256(b'\xa5' + struct.pack('<I', len(c)) + c).digest() for s in secs for c in (s[k:k + (1 << 20)] for k in range(0, len(s), 1 << 20))]
+            self.assertIn(hashlib.sha256(b'\x5a' + struct.pack('<I', len(dig)) + b''.join(dig)).digest(), raw[block:cd_off])
+        finally:
+            shutil.rmtree(t, ignore_errors=True)
+
 
 class DataPack(unittest.TestCase):
     def test_build(self):
@@ -140,6 +170,9 @@ class DataPack(unittest.TestCase):
             bare = android_profile.load(profile_dir([('status', 'experimental')]).name); os.environ.pop('DM_GAMES_DIR', None)   # no setting rows: --touch alone still writes the file
             datapack.build(t / 'bare-data', profile=bare, version='v196608', display='1.03', patched=t / 'patched', romfs=t / 'romfs', shaders=t / 'shaders.dmsv', settings=pipeline.TOUCH_SETTINGS)
             self.assertEqual((t / 'bare-data/settings.txt').read_text(), 'overlay=0\n')
+            man = datapack.build(t / 'apk-pack', profile=p, version='v196608', display='1.03', patched=t / 'patched', romfs=t / 'romfs', shaders=t / 'shaders.dmsv',
+                                 aoc=t / 'aoc', single_apk=True)   # --single-apk: the app finds the pack in its APK, so env.txt names that root
+            self.assertIn(f'DM_AOC_DIR={datapack.PACK_ROOT}/aoc', (t / 'apk-pack/env.txt').read_text()); self.assertTrue(man['single_apk'])
         finally:
             shutil.rmtree(t, ignore_errors=True)
 
@@ -157,6 +190,7 @@ class DataPack(unittest.TestCase):
             self.assertTrue({0xE0E0, 0xE0E1, 0xE0E4, 0xE0E5, 0xE0EF, 0xE100} <= set(cmap))   # A, B, L, R, +, stick
             made = files['nintendo_ext.ttf'].stat().st_mtime_ns
             self.assertEqual(pipeline.Port.button_font(port)[1]['nintendo_ext.ttf'].stat().st_mtime_ns, made)   # reused while the tool and the letters are unchanged
+            self.assertEqual(pipeline.Port.button_font(port, datapack.PACK_ROOT)[0], [f'DM_SHARED_FONT_EXT={datapack.PACK_ROOT}/nintendo_ext.ttf'])   # --single-apk
         finally:
             shutil.rmtree(t, ignore_errors=True)
 

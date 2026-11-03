@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # mkapk.py: build and sign a code-less NativeActivity APK with the Python standard library only (no JDK, no Android SDK).
 #   binary AndroidManifest.xml (AXML) -> stored ZIP with the .so page-aligned -> APK Signature Scheme v2 (RSA-2048, SHA-256) with a self-signed cert.
-# Usage: mkapk.py <lib.so> <out.apk> [key.json] [--package P] [--label L] [--lib NAME] [--landscape] [--icon icon.png] [--release] [--version-code N] [--version-name V]   (the key is created on first use and reused, so reinstalls keep the same signer)
-import hashlib, json, os, secrets, struct, sys, time, zlib
+# Usage: mkapk.py <lib.so> <out.apk> [key.json] [--package P] [--label L] [--lib NAME] [--landscape] [--icon icon.png] [--release] [--version-code N] [--version-name V] [--pack DIR]
+#   (the key is created on first use and reused, so reinstalls keep the same signer). The entries are copied and hashed in pieces, so --pack takes a game of gigabytes in little memory.
+import hashlib, io, json, os, secrets, struct, sys, time, zlib
 
 import argparse as _ap
 _p = _ap.ArgumentParser(); _p.add_argument('so'); _p.add_argument('out'); _p.add_argument('key', nargs='?'); _p.add_argument('--package', default='org.nx2a.probe')
@@ -10,6 +11,7 @@ _p.add_argument('--label', default='NX2A Probe'); _p.add_argument('--lib', defau
 _p.add_argument('--extra-so', action='append', default=[], help='another arm64 library packed beside the main one (a Vulkan validation layer)')
 _p.add_argument('--icon', help='launcher icon (a PNG, used at its own size: nodpi)')
 _p.add_argument('--asset', action='append', default=[], metavar='NAME=FILE', help='a file the app reads with AAssetManager as NAME (assets/NAME in the APK): the gamepad theme')
+_p.add_argument('--pack', metavar='DIR', help='a --single-apk port: every file under DIR (a data pack) as assets/nx2a/<path>, stored, its data 16 KB aligned, read in place by the app')
 _p.add_argument('--release', action='store_true', help='not debuggable')
 _p.add_argument('--version-code', type=int, default=1, help='versionCode: a later port of the game must have a higher one to install over it')
 _p.add_argument('--version-name', default='1.0', help='versionName: the version the player sees (the game\'s display version)'); ARGS = _p.parse_args()
@@ -154,40 +156,80 @@ def cert(k):
     return der_seq(tbs, ALG_SHA256_RSA, der(0x03, b'\0' + rsa_sign(k, tbs)))
 
 # ---------------- ZIP (stored) ----------------
-def build_zip(entries):   # entries: [(name, data, align)]
-    out, cd = bytearray(), bytearray()
+# Written straight to the output file, a file entry copied in 4 MB pieces (a --pack entry can be gigabytes): its CRC is known only after the copy, so it goes into
+# the local header afterwards. The APK stays a plain zip, never Zip64 (offsets and sizes 32-bit, at most 65,534 entries): a layout past that is refused before
+# anything is written, as are names Android's zip reader would refuse.
+ZIP_MAX = 0xffffffff
+class ApkError(Exception): pass
+def entry_size(src): return len(src) if isinstance(src, (bytes, bytearray)) else os.path.getsize(src)
+def entry_pad(off, nb, align):   # the alignment extra field's length before an entry's data, whose local header starts at off
+    pad = -(off + 30 + len(nb)) % align
+    return pad + align if 0 < pad < 4 else pad   # too small for an extra field header: go to the next alignment step
+def zip_plan(entries):   # where the central directory starts and how long it is, checked against the 32-bit limits
+    if len(entries) >= 0xffff: raise ApkError(f'{len(entries):,} entries: a zip without Zip64 holds at most 65,534; the game has too many files for one APK')
+    off = cd = 0
+    for name, src, align in entries:
+        nb = name.encode()
+        if not name or len(nb) > 0xffff or name.startswith('/') or '\\' in name or '..' in name.split('/'): raise ApkError(f'a name Android would refuse in an APK: {name!r}')
+        off += 30 + len(nb) + entry_pad(off, nb, align) + entry_size(src); cd += 46 + len(nb)
+        if off > ZIP_MAX: raise ApkError(f'{name} ends past 4 GiB in the APK: a zip without Zip64 holds at most 4 GiB; the game is too big for one APK')
+    return off, cd
+def build_zip(f, entries):   # entries: [(name, bytes or a file path, align)], written to f from its start; returns (end of the entries, central directory, end of central directory)
+    zip_plan(entries)
+    cd = bytearray()
     dos_time, dos_date = 0, (2026 - 1980) << 9 | 1 << 5 | 1
-    for name, data, align in entries:
-        nb = name.encode(); crc = zlib.crc32(data)
-        pad = -(len(out) + 30 + len(nb)) % align
-        if 0 < pad < 4: pad += align   # too small for an extra field header: go to the next alignment step
+    for name, src, align in entries:
+        nb = name.encode(); flags = 0 if nb.isascii() else 0x800   # bit 11: the name is UTF-8 (a game file's name may not be ASCII)
+        off = f.tell(); pad = entry_pad(off, nb, align)
         extra = struct.pack('<HH', 0xd935, pad - 4) + b'\0' * (pad - 4) if pad else b''   # 0xd935: zipalign's alignment extra field
-        off = len(out)
-        out += struct.pack('<IHHHHHIIIHH', 0x04034b50, 10, 0, 0, dos_time, dos_date, crc, len(data), len(data), len(nb), len(extra)) + nb + extra + data
-        cd += struct.pack('<IHHHHHHIIIHHHHHII', 0x02014b50, 10, 10, 0, 0, dos_time, dos_date, crc, len(data), len(data), len(nb), 0, 0, 0, 0, 0, off) + nb
-    eocd = struct.pack('<IHHHHIIH', 0x06054b50, 0, 0, len(entries), len(entries), len(cd), len(out), 0)
-    return bytes(out), bytes(cd), eocd
+        size = entry_size(src); crc = zlib.crc32(src) if isinstance(src, (bytes, bytearray)) else 0
+        f.write(struct.pack('<IHHHHHIIIHH', 0x04034b50, 10, flags, 0, dos_time, dos_date, crc, size, size, len(nb), len(extra)) + nb + extra)
+        if isinstance(src, (bytes, bytearray)): f.write(src)
+        else:
+            done = 0
+            with open(src, 'rb') as s:
+                while chunk := s.read(4 << 20): crc = zlib.crc32(chunk, crc); f.write(chunk); done += len(chunk)
+            if done != size: raise ApkError(f'{src} changed while it was copied ({size} bytes, then {done})')
+            end = f.tell(); f.seek(off + 14); f.write(struct.pack('<I', crc)); f.seek(end)
+        cd += struct.pack('<IHHHHHHIIIHHHHHII', 0x02014b50, 10, 10, flags, 0, dos_time, dos_date, crc, size, size, len(nb), 0, 0, 0, 0, 0, off) + nb
+    end = f.tell()
+    eocd = struct.pack('<IHHHHIIH', 0x06054b50, 0, 0, len(entries), len(entries), len(cd), end, 0)
+    return end, bytes(cd), eocd
 
 # ---------------- APK Signature Scheme v2 ----------------
 def lp(b): return struct.pack('<I', len(b)) + b
-def chunked_sha256(sections):
-    digests = []
-    for sec in sections:
-        for i in range(0, len(sec), 1 << 20):
-            c = sec[i:i + (1 << 20)]
-            digests.append(hashlib.sha256(b'\xa5' + struct.pack('<I', len(c)) + c).digest())
-    return hashlib.sha256(b'\x5a' + struct.pack('<I', len(digests)) + b''.join(digests)).digest()
-def sign_v2(zip_entries, cd, eocd, k, crt):
+def chunk_digests(read, n, out):   # the 1 MB chunks of one section, each hashed with its length; read(k) gives the next k bytes
+    while n > 0:
+        c = read(min(n, 1 << 20)); n -= len(c)
+        if not c: raise ApkError('the APK ended while it was hashed')
+        out.append(hashlib.sha256(b'\xa5' + struct.pack('<I', len(c)) + c).digest())
+def sign_v2(f, end, cd, eocd, k, crt):   # f holds the entries [0, end); the signing block, the central directory and the EOCD are appended after them
     ALG = 0x0103   # RSASSA-PKCS1-v1_5 with SHA2-256
-    digest = chunked_sha256([zip_entries, cd, eocd])   # EOCD's CD offset still points at the CD start = where the signing block will begin
+    digests = []
+    f.seek(0); chunk_digests(f.read, end, digests)   # the entries are read back from the file: they can be gigabytes
+    for sec in (cd, eocd): chunk_digests(io.BytesIO(sec).read, len(sec), digests)   # EOCD's CD offset still points at the CD start = where the signing block will begin
+    digest = hashlib.sha256(b'\x5a' + struct.pack('<I', len(digests)) + b''.join(digests)).digest()
     signed = lp(lp(struct.pack('<I', ALG) + lp(digest))) + lp(lp(crt)) + lp(b'')
     signer = lp(signed) + lp(lp(struct.pack('<I', ALG) + lp(rsa_sign(k, signed)))) + lp(spki(k))
     value = lp(lp(signer))
     pair = struct.pack('<QI', 4 + len(value), 0x7109871a) + value
     size = len(pair) + 8 + 16
     block = struct.pack('<Q', size) + pair + struct.pack('<Q', size) + b'APK Sig Block 42'
-    new_eocd = eocd[:16] + struct.pack('<I', len(zip_entries) + len(block)) + eocd[20:]
-    return zip_entries + block + cd + new_eocd
+    if end + len(block) + len(cd) + len(eocd) > ZIP_MAX: raise ApkError(f'the signed APK would be {(end + len(block) + len(cd) + len(eocd)) / 2**30:.2f} GiB: a zip without Zip64 holds at most 4 GiB')
+    new_eocd = eocd[:16] + struct.pack('<I', end + len(block)) + eocd[20:]
+    f.seek(end); f.write(block + cd + new_eocd); f.truncate()
+
+# --pack: a --single-apk port's data pack, every file as assets/nx2a/<path>, stored and with its data at a 16 KB aligned offset, so the host reads it in place
+# (dm/android/apkpack.c) and maps shaders.dmsv straight from the APK; an empty folder gets an entry of its own, as nothing else would name it
+PACK_PREFIX, PACK_ALIGN = 'assets/nx2a/', 16384
+def pack_entries(root):
+    out = []
+    for d, dirs, files in os.walk(root):
+        dirs.sort(); rel = os.path.relpath(d, root).replace(os.sep, '/')
+        rel = '' if rel == '.' else rel + '/'
+        if rel and not dirs and not files: out.append((PACK_PREFIX + rel, b'', PACK_ALIGN))
+        out += [(PACK_PREFIX + rel + f, os.path.join(d, f), PACK_ALIGN) for f in sorted(files)]
+    return out
 
 def main():
     so, out = ARGS.so, ARGS.out
@@ -201,9 +243,21 @@ def main():
     entries += [(f'lib/arm64-v8a/{os.path.basename(x)}', open(x, 'rb').read(), 16384) for x in ARGS.extra_so]
     entries += [(f'assets/{n}', open(f, 'rb').read(), 4) for n, _, f in (x.partition('=') for x in ARGS.asset)]   # stored, as every entry: AAsset reads them in place
     if ARGS.icon: entries += [('resources.arsc', res_table('res/drawable-nodpi-v4/icon.png'), 4), ('res/drawable-nodpi-v4/icon.png', open(ARGS.icon, 'rb').read(), 4)]
-    z, cd, eocd = build_zip(entries)
-    apk = sign_v2(z, cd, eocd, k, crt)
-    open(out, 'wb').write(apk)
-    print(f'{out}: {len(apk)} bytes, signer SHA-256 {hashlib.sha256(crt).hexdigest()[:16]}...')
+    if ARGS.pack: entries += pack_entries(ARGS.pack)
+    part = out + '.partial'   # a failed or interrupted build leaves no APK that looks whole
+    try:
+        with open(part, 'w+b') as f:
+            end, cd, eocd = build_zip(f, entries)
+            sign_v2(f, end, cd, eocd, k, crt)
+            size = f.tell()
+        os.replace(part, out)
+    except ApkError as e:
+        if os.path.exists(part): os.remove(part)
+        sys.exit(f'mkapk: {e}')
+    except BaseException:
+        if os.path.exists(part): os.remove(part)
+        raise
+    print(f'{out}: {size} bytes' + (f', {len(entries) - 2:,} more entries ({PACK_PREFIX}: {sum(1 for e in entries if e[0].startswith(PACK_PREFIX)):,})' if ARGS.pack else '')
+          + f', signer SHA-256 {hashlib.sha256(crt).hexdigest()[:16]}...')
 
 if __name__ == '__main__': main()
