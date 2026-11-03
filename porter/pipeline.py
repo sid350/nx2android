@@ -8,7 +8,7 @@ import importlib.util, os, re, shutil, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from porter import config, datapack, dumps, fpslocker, install, paths, profiles, toolchain
+from porter import config, datapack, dumps, fontscale, fpslocker, install, paths, profiles, toolchain
 from porter.adb import Adb, AdbError
 from porter.paths import DM, NXNATIVE
 from porter.upstream import BuildError, PROG, android_profile, game, nacp, nsp, profile_guess, say
@@ -37,6 +37,7 @@ class Options:
     touch: bool = False                # a game played by touch: the on-screen gamepad starts hidden (TOUCH_SETTINGS), so it takes none of the game's touches
     vercode_offset: int = 0            # added to the APK's versionCode: a rebuild of the same game version installs over a build with a higher one (version_code)
     alias_headroom: int = None         # GB more alias region (alias_headroom); None: ALIAS_HEADROOM for a version the profile was not brought up on, none for one it was
+    large_text: float = 0.0            # --large-text: the profile's large_text fonts scaled by this (porter/fontscale.py), 0 = as the game has them
     single_apk: bool = False           # the data pack goes into the APK (assets/nx2a/, read in place by the app): one APK to install, no data pack beside it
     jobs: int = field(default_factory=lambda: os.cpu_count() or 8)
 
@@ -597,6 +598,17 @@ class Port:
         Image.open(src).convert('RGB').resize((256, 256), Image.LANCZOS).save(dst)
         return dst
 
+    # ---- --large-text: the profile's fonts scaled into a patch pak in the RomFS (porter/fontscale.py) ----
+    def large_text(self):
+        if not self.o.large_text: return {}
+        lt = self.ap.large_text
+        if not lt: raise BuildError(f'{self.app_name} has no large_text fonts in its android.tsv: --large-text does not know which fonts the game draws its text with')
+        pak, fonts = lt
+        PROG.set(step=f'scaling {len(fonts)} font(s) by {self.o.large_text:g}')
+        out = fontscale.build(self.game / 'RomFS', pak, fonts, self.o.large_text, self.aw / 'large_text' / Path(pak).name)
+        say(f'large text: {len(fonts)} font(s) scaled by {self.o.large_text:g} into {pak}')
+        return {pak: out}
+
     # ---- data: the files the app reads from its files folder (--single-apk: from its APK; laid out in the build folder for apk() to pack) ----
     def data(self):
         PROG.stage('data pack', step='button-icon font')
@@ -604,7 +616,7 @@ class Port:
         dst = self.aw / 'apk-pack' if self.o.single_apk else self.o.out / f'{app_stem(self.g, self.app_name)}-data'
         man = datapack.build(dst, profile=self.ap, version=self.pkg_ver, display=self.display, patched=self.patched, romfs=self.game / 'RomFS', shaders=self.dmsv,
                              aoc=self.aoc, language=self.lang, package=self.package, env=self.fps_env + font_env, settings=TOUCH_SETTINGS if self.o.touch else None,
-                             files={**self.fps_files, **font_files}, single_apk=self.o.single_apk,
+                             files={**self.fps_files, **font_files}, single_apk=self.o.single_apk, romfs_extra=self.large_text(),
                              progress=lambda what: PROG.set(step=f'linking {what}'))
         self.data_path = dst
         if not self.o.single_apk: self.result['data'] = str(dst)

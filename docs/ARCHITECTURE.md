@@ -44,6 +44,7 @@ A profile is offered for Android when it has an `android.tsv`; the profiles with
 | `setting` | `<name>=<value>`: the pause menu's defaults on first launch (`overlay`, `rumble`, `docked`, `fps`: the frame rate counter in the top left corner, off by default; `opacity`: the gamepad's, 20 to 80 percent by 5, 60 by default), written to the data pack's `settings.txt`, where the app also keeps the player's own gamepad layout from the pause menu's layout editor (`ui=` rows) and its Snap to grid (`grid`, off by default) |
 | `env` | `<KEY>=<VALUE>`: a host switch the game needs on Android, written to the data pack's `env.txt` |
 | `overlay` | `<tablet\|phone> <control> <x> <y>`: moves one on-screen control of that layout (`dm/android/overlay_default.tsv`) to x, y as fractions of the window, compiled into `android_profile.h` |
+| `large_text` | `<patch pak> <font>...` (RomFS paths): the TrueType fonts the game draws its text with. `porter port --large-text [SCALE]` reads them from the game's Unreal paks, divides each one's `unitsPerEm` by the scale and scales its bounding box back down (`porter/fontscale.py`), so the text grows and the windows and line spacing stay; they go into that patch pak in the RomFS, which the engine mounts over the game's own |
 
 Per-build knowledge stays where upstream keeps it: the rewriter's cuts in `patches.py` / `dm/tools/sdk_patches.py`, keyed by build ID.
 

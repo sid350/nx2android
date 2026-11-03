@@ -34,6 +34,9 @@ def _parser():
                     help='GB (0-48) of extra guest address space (the alias region) for a game with virtual address memory, for a game whose log shows '
                          '"AllocateAddressRegion refused (0x1803)" before it crashes; it uses no memory (default: 8 for a game version the profile was not '
                          'brought up on, none for one it was)')
+    po.add_argument('--large-text', type=float, nargs='?', const=1.5, default=0.0, metavar='SCALE',
+                    help="draw the game's text SCALE times larger (default 1.5; 1 to 3), with the windows and the line spacing as they are: the fonts its android.tsv names "
+                         "(large_text) are scaled into a patch pak in the RomFS. Chosen at port time, as --fps60")
     po.add_argument('--single-apk', action='store_true',
                     help='put the game\'s data in the APK (assets/nx2a/, stored and read in place by the app, nothing extracted): one APK to install by tapping it, no data pack '
                          'to push; the APK must stay under 4 GiB, and the device holds the game once, inside the installed app')
@@ -129,9 +132,10 @@ def cmd_port(a):
         env = os.environ.get('NX2A_VERCODE_OFFSET', '').strip() or '0'
         try: offset = int(env)
         except ValueError: print(f'NX2A_VERCODE_OFFSET is not a number: {env}', file=sys.stderr); return 2
+    if a.large_text and not 1 <= a.large_text <= 3: print('--large-text: the scale is 1 to 3', file=sys.stderr); return 2
     opts = pipeline.Options(folder=Path(a.folder), keys=Path(a.keys) if a.keys else None, out=Path(a.out) if a.out else None, version=a.version, language=a.language,
                             app_name=a.app_name, install=a.install, device=a.device, replace_signer=a.replace_signer, debug=a.debug, experimental=a.experimental, package=a.package, fps60=a.fps60, touch=a.touch,
-                            vercode_offset=offset, alias_headroom=a.alias_headroom, single_apk=a.single_apk, jobs=a.jobs)
+                            vercode_offset=offset, alias_headroom=a.alias_headroom, single_apk=a.single_apk, large_text=a.large_text, jobs=a.jobs)
     return _with_progress(a.progress, lambda: pipeline.emit_result(pipeline.Port(opts).run()))
 
 

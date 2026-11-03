@@ -37,9 +37,9 @@ PACK_ROOT = '/nx2a-apk'                     # where the app finds a --single-apk
 APK_MANIFEST = f'assets/nx2a/{MANIFEST}'    # the manifest's entry in such an APK
 
 
-def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, language='en-US', package=None, env=(), settings=None, files=None, progress=None, single_apk=False):
+def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, language='en-US', package=None, env=(), settings=None, files=None, progress=None, single_apk=False, romfs_extra=None):
     """Write the pack to dst (replacing it). profile: the AndroidProfile; package: the app's, when not the profile's; env: more env.txt rows, after the profile's; settings: settings.txt values over the profile's;
-    files: {name in the pack: source} (the 60 fps memory writes, fpslock.tsv; the button-icon font); single_apk: the pack goes into the APK (its paths are under PACK_ROOT). Returns the manifest"""
+    files: {name in the pack: source} (the 60 fps memory writes, fpslock.tsv; the button-icon font); single_apk: the pack goes into the APK (its paths are under PACK_ROOT); romfs_extra: {RomFS path: source}, files added to the game's RomFS (--large-text's patch pak). Returns the manifest"""
     package = package or profile.package
     root = PACK_ROOT if single_apk else files_folder(package)
     tmp = dst.with_name(dst.name + '.partial')
@@ -50,6 +50,10 @@ def build(dst, *, profile, version, display, patched, romfs, shaders, aoc=None, 
         if not src: continue
         if progress: progress(what)
         dn, db = link_tree(src, tmp / sub); n += dn; b += db
+    for rel, src in (romfs_extra or {}).items():
+        t = tmp / 'RomFS' / rel
+        if t.exists(): t.unlink()   # a hard link into the extraction: replaced, never written through
+        t.parent.mkdir(parents=True, exist_ok=True); shutil.copyfile(src, t); n += 1; b += Path(src).stat().st_size
     link_or_copy(shaders, tmp / 'shaders.dmsv'); n += 1; b += shaders.stat().st_size
     for name, src in (files or {}).items(): shutil.copyfile(src, tmp / name); n += 1; b += Path(src).stat().st_size
     rows = [f'# Written by nx2android\'s porter for {profile.name} ({profile.id}); KEY=VALUE per line, read by the app at launch',

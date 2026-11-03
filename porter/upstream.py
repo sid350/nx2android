@@ -6,13 +6,14 @@ import importlib.util, sys
 
 from porter.paths import DM, NXNATIVE
 
-for d in (DM / 'games', DM / 'tools', DM / 'android/tools'):
+for d in (DM / 'games', DM / 'tools', DM / 'android/tools', DM / 'gfx/tools'):
     if str(d) not in sys.path: sys.path.insert(0, str(d))
 
 import android_profile   # noqa: E402
 import game              # noqa: E402
 import nacp              # noqa: E402
 import profile_guess     # noqa: E402
+import uepak             # noqa: E402  (the Unreal pak reader, for --large-text's fonts)
 
 
 def _load_nsp():

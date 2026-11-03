@@ -9,6 +9,8 @@
 #   setting      <name>=<value>, one row each: the pause menu's defaults on first launch (overlay, rumble, docked, fps, opacity: 20..80 by 5)
 #   env          <KEY>=<VALUE>, one row each: host switches the game needs on Android (the data pack's env.txt)
 #   overlay      <tablet|phone> <control> <x> <y>: moves one control of that layout (dm/android/overlay_default.tsv) to x, y as fractions of the window
+#   large_text   <patch pak> <font>...: what the port's --large-text scales (porter/fontscale.py): the game's TrueType fonts (RomFS paths, read from the game's Unreal paks),
+#                written into a patch pak at that RomFS path, which the engine mounts over the game's own
 # Usage: android_profile.py header <id> <out.h> (android_profile.h for the host: the gamepad layouts, written only when it changes); android_profile.py list;
 #   android_profile.py <id> [<key>] (the profile's keys, or one key's value); android_profile.py theme <id> (the gamepad theme pack porter puts in the APK)
 # From Python: import android_profile; p = android_profile.load(<id>) (None without android.tsv); p.status, p.package, p.settings, p.env, p.overlay_table();
@@ -26,7 +28,7 @@ SETTINGS = {'overlay': ('0', '1'), 'rumble': ('0', '1'), 'docked': ('0', '1'), '
             'opacity': tuple(str(v) for v in range(20, 81, 5))}                                    # the gamepad's, percent (overlay_layout.h OV_OPACITY_MIN..MAX)
 REQUIRES = ('bcn',)
 KINDS = {'stick_l': 'OV_STICK_L', 'stick_r': 'OV_STICK_R', 'button': 'OV_BUTTON', 'dpad': 'OV_DPAD', 'menu': 'OV_MENU'}
-SINGLE = ('status', 'tested', 'package', 'orientation', 'requires')
+SINGLE = ('status', 'tested', 'package', 'orientation', 'requires', 'large_text')
 REPEAT = ('setting', 'env', 'overlay')
 
 
@@ -92,6 +94,11 @@ class AndroidProfile:
     def requires(self): return self.get('requires').split()
 
     @property
+    def large_text(self):   # (patch pak, [fonts]) or None: RomFS paths
+        c = self.get('large_text').split()
+        return (c[0], c[1:]) if c else None
+
+    @property
     def settings(self):   # {'overlay': '1', ...}: the defaults the data pack's settings.txt starts with
         return dict(v.split('=', 1) for v in self.values('setting'))
 
@@ -117,6 +124,8 @@ class AndroidProfile:
             k, eq, val = v.partition('=')
             if not eq or k not in SETTINGS or val not in SETTINGS[k]: bad.append(f'setting {v!r}: ' + ', '.join(f'{n}={"|".join(vs)}' for n, vs in SETTINGS.items()))
         bad += [f'env {v!r}: KEY=VALUE' for v in self.values('env') if not re.fullmatch(r'[A-Z_][A-Z0-9_]*=.*', v)]
+        if self.get('large_text') and (len(self.get('large_text').split()) < 2 or not self.large_text[0].endswith('_P.pak')):
+            bad.append('large_text: <patch pak, a RomFS path ending in _P.pak> <font>...')
         names = {r['name'] for r in default_layout()}
         for v in self.values('overlay'):
             c = v.split()
