@@ -1,0 +1,26 @@
+# Keeps this fork's main in step with upstream (shirai91/nx2android): every 12 hours, and by hand from the Actions tab.
+# Upstream's commits are merged into main; a merge conflict stops the run (and GitHub mails the failure) without pushing anything.
+name: sync upstream
+on:
+  schedule:
+    - cron: '17 */12 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: merge upstream/main
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/shirai91/nx2android.git
+          git fetch upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then echo 'already up to date'; exit 0; fi
+          git merge --no-edit upstream/main
+          git push origin HEAD:main
