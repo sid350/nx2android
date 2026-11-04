@@ -26,3 +26,6 @@ title.keys
 
 # The player bundle (python packaging/build_bundle.py)
 /dist/
+
+# cloud saves: a token for the player's Dropbox (docs/SAVE_SYNC.md)
+dropbox.txt
