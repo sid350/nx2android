@@ -91,6 +91,7 @@ struct vkimg {
     VkImageLayout layout;           // version 1 keeps every image in GENERAL after its first use
     int packaged;                   // filled from guest memory (deswizzled upload), re-uploaded when its pages change
     uint64_t pkg_stamp; const void *pkg_span; uint64_t pkg_seen;
+    uint64_t pkg_hash;              // hash of the guest bytes it was last uploaded from: pages written around it with its own bytes unchanged keep what the GPU wrote (gfx_vk_tex.c vk_tex)
     const uint8_t *pkg_mem; size_t pkg_len; uint64_t pkg_used; int pkg_released;   // its storage, the present it was last drawn at, protection given up (vk_tex_sweep)
     uint64_t pkg_vgen; int pkg_sparse;   // a texture of a sparse virtual pool (read through its page table, nvn_sparse_copy): the mapping generation at its upload
     uint64_t used;                  // the present it was last looked up at (vk_tex: evict_overlaps)
@@ -160,3 +161,5 @@ void vk_end_pass(void);     // close an open render pass
 // ---- presentation (gfx_vk_present.c) ----
 void vk_present_init(void);
 uint64_t vk_present(const tex_t *t, double period, const int crop[4]);
+enum { PT_DISPATCH = 0xd15 };   // vk_pass_ts: a dispatch timed as a pass (its format field)
+
