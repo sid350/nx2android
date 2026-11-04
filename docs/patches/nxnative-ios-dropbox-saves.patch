@@ -1,0 +1,599 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=D0=92=D0=B0=D0=B4=D0=B8=D0=BC=20=D0=90=D0=BD=D0=B4=D1=80?=
+ =?UTF-8?q?=D0=B5=D0=B5=D0=B2?= <kolobast@gmail.com>
+Date: Wed, 4 Nov 2026 15:30:00 +0200
+Subject: [PATCH] iOS: cloud saves through the Dropbox API, with the status beside Play
+
+A local patch, not for upstream. Dropbox's folder in the Files app can hand
+back an old copy of a file changed on another device, so a game can start
+with an old save and believe it is in step. With Documents/dropbox.txt in
+place the app reads and writes save.dmsync on Dropbox's servers itself; the
+same file stays visible in the folder, and save_sync.c still decides.
+
+The launcher asks Dropbox before Play and shows the result beside the
+button. Play asks once more; when the save cannot be read, the game does not
+start until the player answers Continue: Yes or No.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+  dm/ios/Sources/DmIOS-Bridging-Header.h |   1 +
+  dm/ios/Sources/DropboxSaves.h          |  32 ++++
+  dm/ios/Sources/DropboxSaves.m          | 272 +++++++++++++++++++++++++++++++++
+  dm/ios/Sources/Launcher.swift          |  15 ++
+  dm/ios/Sources/SaveSync.m              |   3 +
+  dm/ios/Sources/front_ios.m             |   3 +
+  dm/ios/tests/test_dropbox_saves.py     | 154 +++++++++++++++++++
+  7 files changed, 480 insertions(+)
+
+diff --git a/dm/ios/Sources/DmIOS-Bridging-Header.h b/dm/ios/Sources/DmIOS-Bridging-Header.h
+index 1208080b..0131e967 100644
+--- a/dm/ios/Sources/DmIOS-Bridging-Header.h
++++ b/dm/ios/Sources/DmIOS-Bridging-Header.h
+@@ -1,4 +1,5 @@
+ // The Objective-C functions Launcher.swift and GameMenu.swift call (CloudSaves.h, DmGameMenu.h). project.yml points SWIFT_OBJC_BRIDGING_HEADER here.
+ #import "CloudSaves.h"
++#import "DropboxSaves.h"
+ #import "DmGameMenu.h"
+ #import "mods.h"   // dm/host: the mods the game will load (Launcher.swift ModsSection)
+diff --git a/dm/ios/Sources/DropboxSaves.h b/dm/ios/Sources/DropboxSaves.h
+new file mode 100644
+index 00000000..e60a3077
+--- /dev/null
++++ b/dm/ios/Sources/DropboxSaves.h
+@@ -0,0 +1,32 @@
++// Cloud saves straight through the Dropbox API (a local patch, not in upstream). The Dropbox app's folder in Files can hand back an old copy of a file changed on another device, so with
++// settings present the iPhone reads and writes save.dmsync on Dropbox's servers itself; save_sync.c still packs, compares, decides and keeps the backups. The files stay in the same folder.
++// Off unless Documents/dropbox.txt has been put in (KEY=VALUE per line, # comments), the file nx2android's devtools/dropbox_token.py writes:
++//   app_key=...         the Dropbox app the token was given to
++//   refresh_token=...   stands for the player's account: treated as a password
++//   folder=/Saves       optional: the folder holding <title ID>/save.dmsync, from the root of the app's folder
++// The file is moved at once to Library (out of Files and of device backups). Neither token is ever logged. DM_SAVE_SYNC=0 in env.txt turns sync off.
++#import <Foundation/Foundation.h>
++#if __has_include(<UIKit/UIKit.h>)
++#import <UIKit/UIKit.h>
++#endif
++
++NS_ASSUME_NONNULL_BEGIN
++
++/// Takes in dropbox.txt and sets DM_SAVE_SYNC; NO when Dropbox saves are off.
++BOOL dm_dropbox_enabled(void);
++
++/// Asks Dropbox now, on a queue of its own: what the launcher shows beside Play. `done` runs on the main thread. state: 1 a valid cloud save, 0 none in the cloud, -1 cannot be read.
++/// The save it downloaded is the one the game's first save mount takes, so the mount does not wait for the network again.
++void dm_dropbox_check(void (^done)(NSInteger state, NSString *text));
++
++/// front_save_sync_fetch and front_save_sync_store (SaveSync.m) when Dropbox saves are on.
++int dm_dropbox_fetch(const char *cloud, const char *local);
++int dm_dropbox_store(const char *local, const char *cloud);
++
++#if __has_include(<UIKit/UIKit.h>)
++/// At Play (startGame): asks Dropbox once more and, when the save cannot be read, asks the player whether to start anyway. YES = go on now; NO = it has taken over, and calls `go` (start the
++/// game) or `back` (the player said no) on the main thread.
++BOOL dm_dropbox_gate(UIViewController *vc, void (^go)(void), void (^back)(void));
++#endif
++
++NS_ASSUME_NONNULL_END
+diff --git a/dm/ios/Sources/DropboxSaves.m b/dm/ios/Sources/DropboxSaves.m
+new file mode 100644
+index 00000000..32c887f7
+--- /dev/null
++++ b/dm/ios/Sources/DropboxSaves.m
+@@ -0,0 +1,272 @@
++// See DropboxSaves.h. Foundation only, apart from the dialog at Play, so dm/ios/tests/test_dropbox_saves.py runs the rest on the Mac against a local server.
++#import "DropboxSaves.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "save_sync.h"
++#ifndef DM_GAME_ID
++#include "game_profile.h"
++#endif
++
++#ifndef DM_DROPBOX_API
++#define DM_DROPBOX_API "https://api.dropboxapi.com"
++#endif
++#ifndef DM_DROPBOX_CONTENT
++#define DM_DROPBOX_CONTENT "https://content.dropboxapi.com"
++#endif
++#define DBLOG(...) do { fprintf(stderr, "[dm] save sync: " __VA_ARGS__); fputc('\n', stderr); } while (0)
++#define DBRED(...) do { fprintf(stderr, "[dm] [RED] save sync: " __VA_ARGS__); fputc('\n', stderr); } while (0)
++static const NSTimeInterval REQUEST_S = 15, RESOURCE_S = 60;
++enum { PRE_NONE = -2 };
++
++static NSString *g_app_key, *g_refresh, *g_folder = @"/Saves", *g_dir, *g_access;
++static NSDate *g_access_until;
++static BOOL g_on;
++static NSInteger g_pre = PRE_NONE;   // what the last check left for the first save mount: 1 the file below, 0 none in the cloud, -1 cannot be read
++static NSString *g_pre_file;
++
++static NSString *L(NSString *en, NSString *ru) { return [NSLocale.preferredLanguages.firstObject hasPrefix:@"ru"] ? ru : en; }
++
++// ---------- the settings ----------
++static BOOL value_ok(NSString *v) {
++    for (NSUInteger i = 0; i < v.length; i++) { unichar c = [v characterAtIndex:i]; if (c <= 0x20 || c == 0x7f || c == '"' || c == '\\' || c == '&') return NO; }
++    return YES;
++}
++
++static BOOL conf_read(NSString *path) {   // never logs a line: it may hold the token
++    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
++    if (!text) return NO;
++    NSString *key = nil, *refresh = nil, *folder = @"/Saves";
++    for (NSString *raw in [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
++        NSString *ln = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
++        NSRange eq = [ln rangeOfString:@"="];
++        if ([ln hasPrefix:@"#"] || eq.location == NSNotFound) continue;
++        NSString *k = [ln substringToIndex:eq.location], *v = [ln substringFromIndex:eq.location + 1];
++        if (!value_ok(v)) return NO;
++        if ([k isEqualToString:@"app_key"]) key = v;
++        else if ([k isEqualToString:@"refresh_token"]) refresh = v;
++        else if ([k isEqualToString:@"folder"]) folder = v;
++    }
++    while ([folder hasSuffix:@"/"]) folder = [folder substringToIndex:folder.length - 1];
++    if (!key.length || !refresh.length || (folder.length && ![folder hasPrefix:@"/"])) return NO;
++    g_app_key = key; g_refresh = refresh; g_folder = folder;
++    return YES;
++}
++
++static void setup(void) {
++    NSFileManager *fm = NSFileManager.defaultManager;
++    NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES)[0], *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
++    g_dir = [lib stringByAppendingPathComponent:@"dropbox-saves"];
++    NSString *conf = [g_dir stringByAppendingPathComponent:@"dropbox.conf"], *from = [doc stringByAppendingPathComponent:@"dropbox.txt"];
++    NSDictionary *only_me = @{NSFilePosixPermissions: @0700, NSFileProtectionKey: NSFileProtectionCompleteUntilFirstUserAuthentication};
++    [fm createDirectoryAtPath:g_dir withIntermediateDirectories:YES attributes:only_me error:nil];
++    NSURL *dir = [NSURL fileURLWithPath:g_dir]; [dir setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:nil];
++    if ([fm fileExistsAtPath:from]) {
++        if (!conf_read(from)) DBRED("Documents/dropbox.txt has no app_key and refresh_token (or a bad value): it was not taken");
++        else {
++            NSString *tmp = [conf stringByAppendingString:@".new"];
++            [fm removeItemAtPath:tmp error:nil];
++            BOOL ok = [fm copyItemAtPath:from toPath:tmp error:nil] && !rename(tmp.fileSystemRepresentation, conf.fileSystemRepresentation);
++            if (!ok) { [fm removeItemAtPath:tmp error:nil]; DBRED("cannot store the Dropbox settings"); }
++            else {
++                [fm setAttributes:@{NSFilePosixPermissions: @0600} ofItemAtPath:conf error:nil];
++                if (![fm removeItemAtPath:from error:nil]) DBRED("the settings are stored, but Documents/dropbox.txt cannot be removed: remove it, it holds the token");
++                DBLOG("Dropbox settings taken in");
++            }
++        }
++    }
++    g_app_key = g_refresh = nil;
++    const char *v = getenv("DM_SAVE_SYNC");
++    if ((v && !strcmp(v, "0")) || !conf_read(conf)) return;
++    // A local path: save_sync.c makes its parent folders, and only its end, <title ID>/save.dmsync, names the file. It wins over the folder picked in Cloud saves (dm_cloud_saves_env leaves an env value)
++    setenv("DM_SAVE_SYNC", [g_dir stringByAppendingPathComponent:@"cloud"].fileSystemRepresentation, 1);
++    g_on = YES;
++    DBLOG("through the Dropbox API");
++}
++
++BOOL dm_dropbox_enabled(void) {
++    static dispatch_once_t once; dispatch_once(&once, ^{ setup(); });
++    return g_on;
++}
++
++// ---------- requests ----------
++@interface DmDropboxSession : NSObject <NSURLSessionTaskDelegate>
++@end
++@implementation DmDropboxSession
++// No redirect is followed: the request carries the token, and Dropbox's API does not redirect
++- (void)URLSession:(NSURLSession *)s task:(NSURLSessionTask *)t willPerformHTTPRedirection:(NSHTTPURLResponse *)r newRequest:(NSURLRequest *)q completionHandler:(void (^)(NSURLRequest *))done { done(nil); }
++@end
++
++static NSURLSession *session(void) {
++    static NSURLSession *s; static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        NSURLSessionConfiguration *c = NSURLSessionConfiguration.ephemeralSessionConfiguration;
++        c.timeoutIntervalForRequest = REQUEST_S; c.timeoutIntervalForResource = RESOURCE_S; c.waitsForConnectivity = NO; c.URLCache = nil; c.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
++        s = [NSURLSession sessionWithConfiguration:c delegate:[DmDropboxSession new] delegateQueue:nil];
++    });
++    return s;
++}
++
++// The status code, 0 when the request failed. Called off the main thread
++static NSInteger send(NSURLRequest *q, NSString *body_file, NSData **out) {
++    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
++    __block NSInteger code = 0; __block NSData *got = nil;
++    void (^done)(NSData *, NSURLResponse *, NSError *) = ^(NSData *d, NSURLResponse *r, NSError *e) {
++        if (!e && [r isKindOfClass:NSHTTPURLResponse.class]) { code = ((NSHTTPURLResponse *)r).statusCode; got = d; }
++        else if (e) DBLOG("Dropbox: %s (%ld)", e.domain.UTF8String, (long)e.code);   // the domain and code only: the description may quote the request
++        dispatch_semaphore_signal(sem);
++    };
++    NSURLSessionTask *t = body_file ? [session() uploadTaskWithRequest:q fromFile:[NSURL fileURLWithPath:body_file] completionHandler:done] : [session() dataTaskWithRequest:q completionHandler:done];
++    [t resume];
++    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
++    if (out) *out = got;
++    return code;
++}
++
++static NSString *form(NSString *v) {
++    NSMutableCharacterSet *ok = NSCharacterSet.alphanumericCharacterSet.mutableCopy; [ok addCharactersInString:@"-._~"];
++    return [v stringByAddingPercentEncodingWithAllowedCharacters:ok];
++}
++
++static NSString *access_token(BOOL again) {
++    @synchronized (NSURLSession.class) {
++        if (!again && g_access && g_access_until.timeIntervalSinceNow > 60) return g_access;
++        g_access = nil;
++        NSMutableURLRequest *q = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@DM_DROPBOX_API "/oauth2/token"]];
++        q.HTTPMethod = @"POST"; [q setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
++        q.HTTPBody = [[NSString stringWithFormat:@"grant_type=refresh_token&refresh_token=%@&client_id=%@", form(g_refresh), form(g_app_key)] dataUsingEncoding:NSUTF8StringEncoding];
++        NSData *d = nil; NSInteger code = send(q, nil, &d);
++        NSDictionary *o = code == 200 && d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
++        NSString *t = [o isKindOfClass:NSDictionary.class] ? o[@"access_token"] : nil;
++        if (![t isKindOfClass:NSString.class] || !t.length) { DBRED("Dropbox gave no access token (HTTP %ld)", (long)code); return nil; }
++        NSNumber *life = o[@"expires_in"];
++        g_access = t; g_access_until = [NSDate dateWithTimeIntervalSinceNow:[life isKindOfClass:NSNumber.class] ? life.doubleValue : 3600];
++        return t;
++    }
++}
++
++// A header holds ASCII only, so anything else in the JSON goes as \uXXXX (Dropbox's rule for Dropbox-API-Arg)
++static NSString *api_arg(NSDictionary *o) {
++    NSString *json = [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:o options:NSJSONWritingWithoutEscapingSlashes error:nil] encoding:NSUTF8StringEncoding];
++    NSMutableString *s = [NSMutableString string];
++    for (NSUInteger i = 0; i < json.length; i++) { unichar c = [json characterAtIndex:i]; if (c < 0x7f) [s appendFormat:@"%C", c]; else [s appendFormat:@"\\u%04x", c]; }
++    return s;
++}
++
++static NSInteger content_call(NSString *call, NSDictionary *arg, NSString *body_file, NSData **out) {
++    for (int attempt = 0; attempt < 2; attempt++) {   // a token Dropbox refuses (expired early, revoked) is asked for again once
++        NSString *token = access_token(attempt > 0);
++        if (!token) return 0;
++        NSMutableURLRequest *q = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[@DM_DROPBOX_CONTENT stringByAppendingString:call]]];
++        q.HTTPMethod = @"POST";
++        [q setValue:[@"Bearer " stringByAppendingString:token] forHTTPHeaderField:@"Authorization"];
++        [q setValue:api_arg(arg) forHTTPHeaderField:@"Dropbox-API-Arg"];
++        [q setValue:@"application/octet-stream" forHTTPHeaderField:@"Content-Type"];
++        NSInteger code = send(q, body_file, out);
++        if (code != 401) return code;
++    }
++    return 401;
++}
++
++// 1 = written to `to`, 0 = no such file in Dropbox, -1 = cannot be read now
++static int download(NSString *path, NSString *to) {
++    NSData *d = nil; NSInteger code = content_call(@"/2/files/download", @{@"path": path}, nil, &d);
++    if (code == 200 && d) return [d writeToFile:to options:NSDataWritingAtomic error:nil] ? 1 : -1;
++    if (code == 409 && d) {
++        NSDictionary *o = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
++        NSString *why = [o isKindOfClass:NSDictionary.class] ? o[@"error_summary"] : nil;
++        if ([why isKindOfClass:NSString.class] && [why hasPrefix:@"path/not_found"]) return 0;
++    }
++    if (code) DBRED("reading the save from Dropbox failed (HTTP %ld)", (long)code);
++    return -1;
++}
++
++static NSString *title_id(void) { return [@DM_GAME_ID uppercaseString]; }
++static NSString *cloud_path(void) { return [NSString stringWithFormat:@"%@/%@/save.dmsync", g_folder, title_id()]; }
++
++// ---------- the check ----------
++static dispatch_queue_t queue(void) {
++    static dispatch_queue_t q; static dispatch_once_t once;
++    dispatch_once(&once, ^{ q = dispatch_queue_create("dm.dropbox.check", DISPATCH_QUEUE_SERIAL); });
++    return q;
++}
++
++static NSString *when(int64_t t) {
++    NSDateFormatter *f = [NSDateFormatter new]; f.dateStyle = NSDateFormatterShortStyle; f.timeStyle = NSDateFormatterShortStyle;
++    return [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)t]];
++}
++
++static NSInteger check_now(NSString **text) {
++    NSString *file = [g_dir stringByAppendingPathComponent:@"check.dmsync"];
++    [NSFileManager.defaultManager removeItemAtPath:file error:nil];
++    int got = download(cloud_path(), file);
++    ss_meta cloud = {0}, here = {0};
++    const char *save = getenv("DM_SAVE");
++    BOOL have_here = save && !ss_scan(save, &here) && here.files;
++    if (got == 1 && ss_read(file.fileSystemRepresentation, NULL, &cloud)) { DBRED("the save in Dropbox is damaged"); got = -1; }
++    else if (got == 1 && strcasecmp(cloud.title, title_id().UTF8String)) { DBRED("the save in Dropbox is %s's, not this game's", cloud.title); got = -1; }
++    @synchronized (NSURLSession.class) { g_pre = got; g_pre_file = got == 1 ? file : nil; }
++    if (got < 0) *text = L(@"Cloud save: unavailable", @"Облачный сейв: недоступен");
++    else if (!got) *text = have_here ? L(@"Cloud save: none yet; this device's goes up after a save", @"Облачного сейва ещё нет; сейв этого устройства уйдёт после сохранения") : L(@"Cloud save: none yet", @"Облачного сейва ещё нет");
++    else {
++        NSString *rel = !have_here ? L(@"nothing on this device", @"на этом устройстве сейва нет")
++                      : !strcmp(here.hash, cloud.hash) ? L(@"same as on this device", @"совпадает с этим устройством")
++                      : cloud.saved > here.saved ? L(@"newer than on this device", @"новее, чем на этом устройстве") : L(@"older than on this device", @"старее, чем на этом устройстве");
++        *text = [NSString stringWithFormat:L(@"Cloud save: available\n%s, %@\n%@", @"Облачный сейв: доступен\n%s, %@\n%@"), cloud.device, when(cloud.saved), rel];
++    }
++    return got;
++}
++
++void dm_dropbox_check(void (^done)(NSInteger, NSString *)) {
++    if (!dm_dropbox_enabled()) return;
++    dispatch_async(queue(), ^{
++        NSString *text = nil; NSInteger state = check_now(&text);
++        dispatch_async(dispatch_get_main_queue(), ^{ done(state, text); });
++    });
++}
++
++// ---------- the transport ----------
++int dm_dropbox_fetch(const char *cloud, const char *local) {
++    @autoreleasepool {
++        NSInteger pre; NSString *file;
++        @synchronized (NSURLSession.class) { pre = g_pre; file = g_pre_file; g_pre = PRE_NONE; g_pre_file = nil; }
++        NSString *to = @(local);
++        if (pre == PRE_NONE) return download(cloud_path(), to);   // not the first mount: the sender's own look, always fresh
++        if (pre != 1) return (int)pre;
++        NSFileManager *fm = NSFileManager.defaultManager;
++        [fm removeItemAtPath:to error:nil];
++        return [fm copyItemAtPath:file toPath:to error:nil] ? 1 : -1;
++    }
++}
++
++int dm_dropbox_store(const char *local, const char *cloud) {
++    @autoreleasepool {
++        NSInteger code = content_call(@"/2/files/upload", @{@"path": cloud_path(), @"mode": @"overwrite", @"autorename": @NO, @"mute": @YES}, @(local), NULL);
++        if (code == 200) return 1;
++        if (code) DBRED("sending the save to Dropbox failed (HTTP %ld)", (long)code);
++        return 0;
++    }
++}
++
++// ---------- the dialog at Play ----------
++#if __has_include(<UIKit/UIKit.h>)
++BOOL dm_dropbox_gate(UIViewController *vc, void (^go)(void), void (^back)(void)) {
++    static BOOL passed;
++    if (passed || !dm_dropbox_enabled()) return YES;
++    UIAlertController *wait = [UIAlertController alertControllerWithTitle:L(@"Checking the cloud save…", @"Проверяю облачный сейв…") message:nil preferredStyle:UIAlertControllerStyleAlert];
++    [vc presentViewController:wait animated:NO completion:nil];
++    dm_dropbox_check(^(NSInteger state, NSString *text) {
++        [wait dismissViewControllerAnimated:NO completion:^{
++            if (state >= 0) { passed = YES; go(); return; }
++            UIAlertController *a = [UIAlertController alertControllerWithTitle:L(@"Cloud save unavailable", @"Облачный сейв недоступен")
++                message:L(@"It could not be downloaded, so the game would start with this device's save, which may be older. If you then save, it may replace the one in the cloud (a copy stays in save-backups). Continue?",
++                          @"Его не удалось скачать, поэтому игра запустится с сейвом этого устройства, а он может быть старее. Если потом сохраниться, он может заменить сейв в облаке (копия останется в save-backups). Продолжить?")
++                preferredStyle:UIAlertControllerStyleAlert];
++            [a addAction:[UIAlertAction actionWithTitle:L(@"No", @"Нет") style:UIAlertActionStyleCancel handler:^(UIAlertAction *x) { back(); }]];
++            [a addAction:[UIAlertAction actionWithTitle:L(@"Yes", @"Да") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) { DBLOG("the player started without the cloud save"); passed = YES; go(); }]];
++            [vc presentViewController:a animated:NO completion:nil];
++        }];
++    });
++    return NO;
++}
++#endif
+diff --git a/dm/ios/Sources/Launcher.swift b/dm/ios/Sources/Launcher.swift
+index 8bef3839..3ae4201d 100644
+--- a/dm/ios/Sources/Launcher.swift
++++ b/dm/ios/Sources/Launcher.swift
+@@ -211,6 +211,15 @@ private struct LauncherView: View {
+     @ObservedObject var mods: ModsModel
+     let play: () -> Void
+     @State private var memory = os_proc_available_memory()
++    @State private var cloudState = 1
++    @State private var cloudText = ""
++    @Environment(\.scenePhase) private var scenePhase
++
++    private func checkCloud() {   // the Dropbox save, asked for before Play (DropboxSaves.h)
++        guard dm_dropbox_enabled() else { return }
++        if cloudText.isEmpty { cloudText = "\u{2026}" }
++        dm_dropbox_check { state, text in cloudState = state; cloudText = text }
++    }
+ 
+     var body: some View {
+         GeometryReader { geometry in
+@@ -226,6 +235,10 @@ private struct LauncherView: View {
+                     Text("Version \((info("CFBundleShortVersionString") as? String) ?? "")")
+                         .font(.callout).foregroundStyle(.secondary)
+                     playButton
++                    if !cloudText.isEmpty {
++                        Button(action: checkCloud) { Text(cloudText).font(.footnote).multilineTextAlignment(.center).foregroundStyle(cloudState < 0 ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary)) }
++                            .buttonStyle(.plain)
++                    }
+                 }
+                 .padding(16)
+                 .frame(width: geometry.size.width / 3, height: geometry.size.height)
+@@ -260,6 +273,8 @@ private struct LauncherView: View {
+             }
+         }
+         .preferredColorScheme(.dark)
++        .onAppear(perform: checkCloud)
++        .onChange(of: scenePhase) { _, phase in if phase == .active { checkCloud() } }
+         .task {
+             while !Task.isCancelled {
+                 memory = os_proc_available_memory()
+diff --git a/dm/ios/Sources/SaveSync.m b/dm/ios/Sources/SaveSync.m
+index 4b81728d..e4cdb44e 100644
+--- a/dm/ios/Sources/SaveSync.m
++++ b/dm/ios/Sources/SaveSync.m
+@@ -7,8 +7,10 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include "save_sync.h"
++#import "DropboxSaves.h"
+ 
+ int front_save_sync_fetch(const char *cloud, const char *local) {
++    if (dm_dropbox_enabled()) return dm_dropbox_fetch(cloud, local);   // the Dropbox API instead of the file provider (DropboxSaves.h)
+     @autoreleasepool {
+         NSFileManager *fm = [NSFileManager new];
+         NSURL *src = [NSURL fileURLWithPath:@(cloud)], *dst = [NSURL fileURLWithPath:@(local)];
+@@ -31,6 +33,7 @@ int front_save_sync_fetch(const char *cloud, const char *local) {
+ }
+ 
+ int front_save_sync_store(const char *local, const char *cloud) {
++    if (dm_dropbox_enabled()) return dm_dropbox_store(local, cloud);
+     @autoreleasepool {
+         NSFileManager *fm = [NSFileManager new];
+         NSURL *dst = [NSURL fileURLWithPath:@(cloud)];
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+index 6238a706..f47cb38d 100644
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -13,6 +13,7 @@
+ #include "haptics_apple.h"
+ #include "save_sync.h"
+ #import "CloudSaves.h"
++#import "DropboxSaves.h"
+ 
+ void dm_gamepad_active(void);
+ #import "DmLayout.h"
+@@ -142,6 +143,8 @@ - (void)hingeChanged:(UIHinge *)hinge API_AVAILABLE(ios(27.1)) {
+ // The game view, the pad and the frame-rate counter are made once the launcher has set the switches they read (DM_SHOW_FPS, DM_METAL_HUD); the host's loading began at app launch (main.m)
+ - (void)startGame {
+     if (self.game) return;
++    // Before anything starts: the cloud save is asked for now, and the player decides when it cannot be read (DropboxSaves.h). No: back to the launcher, or out when there is none
++    if (!dm_dropbox_gate(self, ^{ [self startGame]; }, ^{ if (!dm_show_launcher((__bridge void *)self, launcher_done)) exit(0); })) return;
+     dm_cloud_saves_env();   // DM_SAVE_SYNC from the launcher's Cloud saves pick, before the game's first save mount reads it (CloudSaves.m, save_sync.h)
+     front_hud_env();   // before the process's first Metal device, which reads MTL_HUD_ENABLED (an env file's DM_METAL_HUD sets it in main.m already; GitHub issue #840)
+     const char *dev = front_ios_device_check();   // that first device: a GPU without BC textures is refused here, not at launch, so the launcher's HUD switch counts
+diff --git a/dm/ios/tests/test_dropbox_saves.py b/dm/ios/tests/test_dropbox_saves.py
+new file mode 100644
+index 00000000..e1c42e73
+--- /dev/null
++++ b/dm/ios/tests/test_dropbox_saves.py
+@@ -0,0 +1,154 @@
++#!/usr/bin/env python3
++# DropboxSaves.m on the Mac against a local stand-in for Dropbox: no account, no real token. Run: python3 dm/ios/tests/test_dropbox_saves.py
++import http.server, json, os, pathlib, subprocess, sys, tempfile, threading, urllib.parse
++
++ROOT = pathlib.Path(__file__).resolve().parents[3]
++TITLE = '0100000000DM5A9C'
++PATH = f'/Saves/{TITLE}/save.dmsync'
++REFRESH, ACCESS = 'refresh-SECRET-1', 'access-SECRET-2'
++HARNESS = r'''
++#import "DropboxSaves.h"
++#include "save_sync.h"
++int main(int c, char **v) {
++    if (!strcmp(v[1], "enabled")) { printf("%d\n", dm_dropbox_enabled()); return 0; }
++    dm_dropbox_enabled();
++    if (!strcmp(v[1], "fetch")) { int r = dm_dropbox_fetch("x", v[2]); printf("%d\n", r); return 0; }
++    if (!strcmp(v[1], "store")) { printf("%d\n", dm_dropbox_store(v[2], "x")); return 0; }
++    if (!strcmp(v[1], "check")) {
++        __block int done = 0;
++        dm_dropbox_check(^(NSInteger s, NSString *t) { printf("%ld\n%s\n", (long)s, t.UTF8String); done = 1; });
++        while (!done) [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
++        printf("then %d\n", dm_dropbox_fetch("x", v[2]));
++        printf("after %d\n", dm_dropbox_fetch("x", v[3]));
++        return 0;
++    }
++    return 2;
++}
++'''
++
++
++class Dropbox(http.server.BaseHTTPRequestHandler):
++    def log_message(self, *a): pass
++
++    def reply(self, code, body=b'', **headers):
++        self.send_response(code)
++        for k, v in headers.items(): self.send_header(k, v)
++        self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
++
++    def do_POST(self):
++        s = self.server
++        data = self.rfile.read(int(self.headers.get('Content-Length', 0)))
++        s.seen.append(self.path)
++        if self.path == '/redirected': s.redirected = dict(self.headers); return self.reply(200, b'x')
++        if self.path == '/oauth2/token':
++            f = urllib.parse.parse_qs(data.decode())
++            s.tokens += 1
++            if f.get('refresh_token') != [REFRESH] or f.get('client_id') != ['key'] or f.get('grant_type') != ['refresh_token'] or s.mode == 'noauth': return self.reply(400, b'{}')
++            return self.reply(200, json.dumps({'access_token': ACCESS, 'expires_in': 14400}).encode())
++        if self.headers.get('Authorization') != 'Bearer ' + ACCESS: return self.reply(401, b'{}')
++        if s.mode == 'expired-once': s.mode = ''; return self.reply(401, b'{}')
++        if s.mode == 'redirect': return self.reply(302, Location=f'http://127.0.0.1:{s.server_port}/redirected')
++        if s.mode == 'error': return self.reply(500, b'{}')
++        arg = json.loads(self.headers['Dropbox-API-Arg'])
++        s.args.append(arg)
++        if self.path == '/2/files/download':
++            if arg['path'] not in s.files: return self.reply(409, b'{"error_summary": "path/not_found/.."}')
++            if s.mode == 'other409': return self.reply(409, b'{"error_summary": "path/restricted_content/.."}')
++            return self.reply(200, s.files[arg['path']])
++        if self.path == '/2/files/upload': s.files[arg['path']] = data; return self.reply(200, b'{}')
++        self.reply(404)
++
++
++class T:
++    fails = 0
++    def eq(self, got, want, what):
++        ok = got == want
++        print(('ok   ' if ok else 'FAIL ') + what + ('' if ok else f': got {got!r}, want {want!r}'))
++        self.fails += not ok
++
++
++def bundle(title=TITLE, payload=b'hello'):   # a valid packed save (save_sync.c's format, device and date fixed)
++    import hashlib, struct
++    T0 = 1767315845; p = b'save/a.bin'
++    h = struct.pack('<BBHHHQq', 2, 0, len(p), 0, 0, len(payload), T0)
++    digest = hashlib.sha256(h[:16] + p + payload).hexdigest()[:32].encode()
++    return b'DMSYNC1\n' + struct.pack('<II', 1, 1) + digest + struct.pack('<q', T0) + title.encode().ljust(24, b'\0') + b'NP05J'.ljust(64, b'\0') + h + p + payload + b'DMSYNCE\n'
++
++
++def main():
++    t = T()
++    srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Dropbox)
++    srv.seen, srv.args, srv.files, srv.mode, srv.tokens, srv.redirected = [], [], {}, '', 0, None
++    threading.Thread(target=srv.serve_forever, daemon=True).start()
++    url = f'http://127.0.0.1:{srv.server_port}'
++    d = pathlib.Path(tempfile.mkdtemp(prefix='dropbox-saves-'))
++    src = ROOT / 'dm/ios/Sources'
++    (d / 'h.m').write_text(HARNESS)
++    subprocess.run(['clang', '-fobjc-arc', '-Wall', '-Werror', '-Wno-unused-function', f'-I{src}', f'-I{ROOT}/dm/host', f'-DDM_GAME_ID="{TITLE.lower()}"', f'-DDM_DROPBOX_API="{url}"', f'-DDM_DROPBOX_CONTENT="{url}"',
++                    '-framework', 'Foundation', str(d / 'h.m'), str(src / 'DropboxSaves.m'), str(ROOT / 'dm/host/save_sync.c'), '-o', str(d / 'h')], check=True)
++    home = d / 'home'; (home / 'Documents').mkdir(parents=True); (home / 'Library').mkdir()
++    save = d / 'save'; save.mkdir()
++    log = []
++
++    def run(*a):
++        env = {**os.environ, 'CFFIXED_USER_HOME': str(home), 'DM_SAVE': str(save)}; env.pop('DM_SAVE_SYNC', None)
++        r = subprocess.run([str(d / 'h'), *a], capture_output=True, text=True, env=env, timeout=120)
++        log.append(r.stdout + r.stderr)
++        return r.stdout.split('\n')[0], r
++
++    t.eq(run('enabled')[0], '0', 'off without dropbox.txt')
++    (home / 'Documents/dropbox.txt').write_text('# bad\nrefresh_token=only\n')
++    t.eq(run('enabled')[0], '0', 'a bad file is refused')
++    t.eq((home / 'Documents/dropbox.txt').exists(), True, '... and left in place')
++    (home / 'Documents/dropbox.txt').write_text(f'# comment\napp_key=key\nrefresh_token={REFRESH}\n')
++    t.eq(run('enabled')[0], '1', 'on with dropbox.txt')
++    t.eq((home / 'Documents/dropbox.txt').exists(), False, 'dropbox.txt leaves Documents')
++    conf = home / 'Library/dropbox-saves/dropbox.conf'
++    t.eq(oct(conf.stat().st_mode & 0o777), '0o600', 'the settings are private')
++    t.eq(run('enabled')[0], '1', 'still on at the next start')
++
++    out, buf = d / 'o', bundle()
++    t.eq(run('fetch', str(out))[0], '0', 'no file in Dropbox is 0')
++    srv.files[PATH] = buf
++    t.eq(run('fetch', str(out))[0], '1', 'download')
++    t.eq(out.read_bytes(), buf, '... the same bytes')
++    t.eq(srv.args[-1]['path'], PATH, '... from <folder>/<TITLE>/save.dmsync')
++    srv.mode = 'other409'; t.eq(run('fetch', str(out))[0], '-1', 'another 409 is a failure, not "none"')
++    srv.mode = 'error'; t.eq(run('fetch', str(out))[0], '-1', 'a server error is -1')
++    srv.mode = 'noauth'; t.eq(run('fetch', str(out))[0], '-1', 'no token is -1')
++    srv.mode = 'expired-once'; t.eq(run('fetch', str(out))[0], '1', 'a refused token is renewed once')
++    srv.mode = 'redirect'; t.eq(run('fetch', str(out))[0], '-1', 'a redirect is a failure')
++    t.eq(srv.redirected, None, '... and is not followed with the token')
++    srv.mode = ''
++
++    up = d / 'u'; up.write_bytes(b'new')
++    t.eq(run('store', str(up))[0], '1', 'upload')
++    t.eq((srv.files[PATH], srv.args[-1]['mode'], srv.args[-1]['autorename']), (b'new', 'overwrite', False), '... replaces the file')
++    srv.mode = 'error'; t.eq(run('store', str(up))[0], '0', 'a failed upload is 0'); srv.mode = ''
++
++    a, b = d / 'a', d / 'b'
++    srv.files[PATH] = buf
++    _, r = run('check', str(a), str(b))
++    lines = r.stdout.split('\n')
++    t.eq(lines[0], '1', 'check: a valid save')
++    t.eq('NP05J' in r.stdout, True, '... names the device')
++    t.eq('then 1' in r.stdout and a.read_bytes() == buf, True, '... the first mount takes what the check downloaded')
++    t.eq('after 1' in r.stdout, True, '... later looks go to Dropbox')
++    del srv.files[PATH]
++    _, r = run('check', str(a), str(b)); t.eq((r.stdout.split('\n')[0], 'then 0' in r.stdout), ('0', True), 'check: none in the cloud')
++    srv.files[PATH] = buf[:-3]
++    _, r = run('check', str(a), str(b)); t.eq((r.stdout.split('\n')[0], 'then -1' in r.stdout), ('-1', True), 'check: a cut-off file cannot be read')
++    srv.files[PATH] = bundle(title='0100000000000000')
++    _, r = run('check', str(a), str(b)); t.eq(r.stdout.split('\n')[0], '-1', "check: another game's file cannot be read")
++    srv.mode = 'error'
++    _, r = run('check', str(a), str(b)); t.eq((r.stdout.split('\n')[0], 'then -1' in r.stdout), ('-1', True), 'check: Dropbox unreachable')
++    srv.mode = ''
++
++    text = ''.join(log)
++    t.eq(REFRESH in text or ACCESS in text, False, 'neither token is ever printed')
++    if t.fails: sys.exit(f'{t.fails} failed')
++    print('all passed')
++
++
++if __name__ == '__main__':
++    main()
+-- 
+2.x
