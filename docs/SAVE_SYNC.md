@@ -25,6 +25,8 @@ The saves are `/Saves/<title ID>/save.dmsync` from the root of the Dropbox app's
 
 **On an iPhone or a Mac,** choose the same folder in the app's Cloud saves: `Apps/<your app's name>/Saves` (`Приложения/...` in a Russian Dropbox). If a plain folder of that name already exists when you make the Dropbox app, Dropbox names the app's folder differently (`NXNative (1)`); check which folder has the puzzle icon, and that it is the one every device uses.
 
+**An iPhone without the old copies.** Dropbox's folder in the Files app can hand back an old copy of a file changed on another device, so a game can start with an old save and believe it is in step. `docs/patches/nxnative-ios-dropbox-saves.patch` is a patch for an nxnative checkout (`git am`, then build the IPA) with which the iPhone reads and writes the same `save.dmsync` through the Dropbox API, shows beside Play whether the cloud save is available, and at Play asks whether to continue when it cannot be downloaded. Put the same `dropbox.txt` into the app's Documents folder through Files; the app moves it out of there. It is not part of upstream nxnative. It has been tested against a local stand-in for Dropbox only (`dm/ios/tests/test_dropbox_saves.py`), not yet on an iPhone.
+
 ## How it behaves
 
 **When.** The cloud's save comes in at the game's first save mount, waiting at most 10 seconds; without an answer the game plays on with the save it has. A save goes out 3 seconds after the game's last commit, and when the app goes to the background. Android may freeze an app soon after that, so a save made just before leaving may go out only at the next start.
