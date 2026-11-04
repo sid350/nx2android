@@ -9,12 +9,18 @@
 // The requests are HTTP/1.1 written here over java.net sockets (JNI, as pad_watch in front_android.c; the APK has no code of its own). The system's TLS does the encryption and its trust
 // store the chain; a raw SSLSocket checks no host name by itself, so HTTPS endpoint identification is switched on before the handshake and the session is checked again with the default
 // HostnameVerifier after it: a certificate of another site must fail here, or the token goes to whoever presents one. Dropbox replaces a file as a whole (files/upload, overwrite).
+// When the cloud's save could not be read at the game's first save mount, the game waits there and a dialog asks whether to play on with this device's save or to close
+// (front_save_sync_check; DM_TEST_SYNC_FAIL=1 in env.txt makes the read fail, to see it). The APK has no code of its own for a click listener: each button posts a Message to a
+// Handler of a thread that never runs its Looper, and that thread polls hasMessages.
 #include "save_sync.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <android/looper.h>
+#include <android/native_activity.h>
 #include <jni.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +35,9 @@ enum { CONNECT_MS = 5000, READ_MS = 15000, IOBUF = 16384 };
 static const char API_HOST[] = "api.dropboxapi.com", CONTENT_HOST[] = "content.dropboxapi.com";
 
 static JavaVM *g_vm;
+static ANativeActivity *g_act;
+static ALooper *g_main;   // the activity's main thread, where a dialog is made
+static _Atomic int g_first_read;   // the first read of the cloud's save: 0 not started, 1 under way, 2 answered, 3 failed
 static char g_conf[PATH_MAX];
 static pthread_mutex_t g_token_mu = PTHREAD_MUTEX_INITIALIZER;
 static char g_token[2048];   // the short-lived access token
@@ -76,8 +85,8 @@ static void conf_take(const char *files) {
 }
 
 // front_android.c, before env.txt is read (its DM_SAVE_SYNC=0 wins). files: the external files folder, internal: internalDataPath (<data>/files)
-void save_sync_android_start(JavaVM *vm, const char *files, const char *internal) {
-    g_vm = vm;
+void save_sync_android_start(ANativeActivity *act, const char *files, const char *internal) {
+    g_act = act; g_vm = act->vm;
     char dir[PATH_MAX]; snprintf(dir, sizeof dir, "%s", internal);
     char *up = strrchr(dir, '/'); if (!up) return;
     snprintf(up, sizeof dir - (size_t)(up - dir), "/no_backup"); mkdir(dir, 0700);
@@ -85,6 +94,7 @@ void save_sync_android_start(JavaVM *vm, const char *files, const char *internal
     conf_take(files);
     if (access(g_conf, F_OK)) return;
     char cloud[PATH_MAX]; snprintf(cloud, sizeof cloud, "%s/cloud", internal); setenv("DM_SAVE_SYNC", cloud, 0);
+    if ((g_main = ALooper_forThread())) ALooper_acquire(g_main);
 }
 
 // ---------- JNI: a TLS socket and its streams ----------
@@ -316,7 +326,15 @@ static void jni_off(int attached) { if (attached) (*g_vm)->DetachCurrentThread(g
 
 // ---------- the two calls save_sync.c makes ----------
 // 1 = copied, 0 = there is none, -1 = failed
+static int fetch_(const char *cloud, const char *local);
 int front_save_sync_fetch(const char *cloud, const char *local) {
+    int expect = 0, first = atomic_compare_exchange_strong(&g_first_read, &expect, 1);
+    const char *t = getenv("DM_TEST_SYNC_FAIL");
+    int r = t && *t == '1' ? -1 : fetch_(cloud, local);
+    if (first) atomic_store(&g_first_read, r < 0 ? 3 : 2);
+    return r;
+}
+static int fetch_(const char *cloud, const char *local) {
     box_t d; char tail[128], token[2048], headers[3000]; int attached, result = -1;
     if (conf_read(g_conf, &d) || tail_of(cloud, tail, sizeof tail)) { DRED("no usable Dropbox settings (dropbox.txt in the files folder)"); return -1; }
     JNIEnv *E = jni_on(&attached);
@@ -366,4 +384,63 @@ int front_save_sync_store(const char *local, const char *cloud) {
     if (fd >= 0) close(fd);
     memset(&d, 0, sizeof d); memset(token, 0, sizeof token); memset(headers, 0, sizeof headers);
     return ok;
+}
+
+// ---------- the question when the cloud's save cannot be read ----------
+enum { ANS_CONTINUE = 1, ANS_CLOSE = 2 };
+static jobject g_ask_handler;   // the waiting thread's Handler, a global reference
+static int g_ask_pipe[2];
+static _Atomic int g_ask_shown;   // 1 the dialog is up, -1 it could not be made
+
+static int ask_on_main(int fd, int events, void *data) {   // on the activity's main thread, once
+    (void)events; (void)data; char b; if (read(fd, &b, 1) < 0) b = 0;
+    JNIEnv *E = g_act->env;
+    jclass cB = (*E)->FindClass(E, "android/app/AlertDialog$Builder"), cD = (*E)->FindClass(E, "android/app/AlertDialog"), cM = (*E)->FindClass(E, "android/os/Message");
+    jobject bu = (*E)->NewObject(E, cB, (*E)->GetMethodID(E, cB, "<init>", "(Landroid/content/Context;)V"), g_act->clazz);
+    (*E)->CallObjectMethod(E, bu, (*E)->GetMethodID(E, cB, "setTitle", "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;"), (*E)->NewStringUTF(E, "Cloud save not available"));
+    (*E)->CallObjectMethod(E, bu, (*E)->GetMethodID(E, cB, "setMessage", "(Ljava/lang/CharSequence;)Landroid/app/AlertDialog$Builder;"),
+                           (*E)->NewStringUTF(E, "The save could not be read from Dropbox. Play on with the save on this device? If you save, it may replace a newer save from another device."));
+    (*E)->CallObjectMethod(E, bu, (*E)->GetMethodID(E, cB, "setCancelable", "(Z)Landroid/app/AlertDialog$Builder;"), JNI_FALSE);
+    jobject d = (*E)->CallObjectMethod(E, bu, (*E)->GetMethodID(E, cB, "create", "()Landroid/app/AlertDialog;"));
+    jmethodID obtain = (*E)->GetStaticMethodID(E, cM, "obtain", "(Landroid/os/Handler;I)Landroid/os/Message;"), set = (*E)->GetMethodID(E, cD, "setButton", "(ILjava/lang/CharSequence;Landroid/os/Message;)V");
+    (*E)->CallVoidMethod(E, d, set, -1, (*E)->NewStringUTF(E, "Play on"), (*E)->CallStaticObjectMethod(E, cM, obtain, g_ask_handler, ANS_CONTINUE));   // BUTTON_POSITIVE
+    (*E)->CallVoidMethod(E, d, set, -2, (*E)->NewStringUTF(E, "Close the game"), (*E)->CallStaticObjectMethod(E, cM, obtain, g_ask_handler, ANS_CLOSE));   // BUTTON_NEGATIVE
+    (*E)->CallVoidMethod(E, d, (*E)->GetMethodID(E, cD, "show", "()V"));
+    atomic_store(&g_ask_shown, jfail(E, "showing the question") ? -1 : 1);
+    return 0;   // the callback once
+}
+
+static void *ask_thread(void *arg) {   // the answer through arg; "play on" when no dialog can be shown: the game must not hang on it
+    int *ans = arg, attached; *ans = ANS_CONTINUE;
+    JNIEnv *E = jni_on(&attached); if (!E) return NULL;
+    jclass cL = (*E)->FindClass(E, "android/os/Looper"), cH = (*E)->FindClass(E, "android/os/Handler");
+    (*E)->CallStaticVoidMethod(E, cL, (*E)->GetStaticMethodID(E, cL, "prepare", "()V"));
+    jobject lo = (*E)->CallStaticObjectMethod(E, cL, (*E)->GetStaticMethodID(E, cL, "myLooper", "()Landroid/os/Looper;"));
+    jobject h = jfail(E, "preparing the question") ? NULL : (*E)->NewObject(E, cH, (*E)->GetMethodID(E, cH, "<init>", "(Landroid/os/Looper;)V"), lo);
+    if (h && !jfail(E, "preparing the question") && !pipe(g_ask_pipe)) {
+        g_ask_handler = (*E)->NewGlobalRef(E, h);
+        jmethodID has = (*E)->GetMethodID(E, cH, "hasMessages", "(I)Z");
+        ALooper_addFd(g_main, g_ask_pipe[0], ALOOPER_POLL_CALLBACK, ALOOPER_EVENT_INPUT, ask_on_main, NULL);
+        if (write(g_ask_pipe[1], "x", 1) != 1) atomic_store(&g_ask_shown, -1);
+        while (atomic_load(&g_ask_shown) >= 0) {
+            if ((*E)->CallBooleanMethod(E, h, has, ANS_CLOSE)) { *ans = ANS_CLOSE; break; }
+            if ((*E)->CallBooleanMethod(E, h, has, ANS_CONTINUE)) break;
+            usleep(100000);
+        }
+    }
+    jfail(E, "the question");
+    jni_off(attached);
+    return NULL;
+}
+
+// hle_fs.c, after the game's first save mount brought the cloud's save in or could not: the game waits here for the answer. Asks once
+void front_save_sync_check(void) {
+    int st = atomic_load(&g_first_read); static _Atomic int asked;
+    if ((st != 1 && st != 3) || !g_main || atomic_exchange(&asked, 1)) return;
+    DLOG("the cloud's save cannot be read: asking");
+    int ans = ANS_CONTINUE; pthread_t t;
+    if (pthread_create(&t, NULL, ask_thread, &ans)) { DRED("no thread for the question: playing on"); return; }
+    pthread_join(t, NULL);
+    DLOG("the player chose: %s", ans == ANS_CLOSE ? "close the game" : "play on with this device's save");
+    if (ans == ANS_CLOSE) _exit(0);
 }
