@@ -15,6 +15,7 @@
 #include "stick_axis.h"
 #include "pixel_font.h"
 #include "saves_android.h"
+#include "save_sync.h"
 #include <math.h>
 #include <time.h>
 #include <android/asset_manager.h>
@@ -185,7 +186,7 @@ static void go_background(void) { if (!atomic_load(&g_running) || atomic_exchang
 static void go_foreground(void) { if (!atomic_load(&g_running) || !atomic_exchange(&g_bg, 0)) return; dm_gfx_suspend(0); hold_sync(); dm_focus_set(2); shake_sensor(1); }
 void dm_perf_gpu_release(void);   // perf_android.c: the GPU's clock control back to its governor (DM_GPU_TURBO)
 // The clock control goes back after go_background: its dm_gfx_suspend waits for the presents in progress, and one of them could otherwise set the GPU's power control again
-static void on_pause(ANativeActivity *a) { (void)a; go_background(); dm_perf_gpu_release(); }
+static void on_pause(ANativeActivity *a) { (void)a; go_background(); dm_perf_gpu_release(); save_sync_flush(0); }   // save_sync_flush wakes the cloud sender and does not wait for it (the main thread)
 // Back in front, the game is out of focus until the window has the input focus again (Android sends it after onResume): without this it stayed OutOfFocus for good,
 // and Blasphemous 2's Unity, which asks for focus notifications, kept its title paused and ignored every press after a trip to another app. A window losing focus while in
 // front (a system dialog, the notification shade) is OutOfFocus as on the Switch's HOME overlay
@@ -1583,6 +1584,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     setenv("DM_ROOT", g_root, 1);
     snprintf(p, sizeof p, "%s/RomFS", g_root); setenv("DM_ROMFS", p, 0);
     snprintf(p, sizeof p, "%s/save", act->internalDataPath); mkdir(p, 0700); setenv("DM_SAVE", p, 0);
+    { void save_sync_android_start(JavaVM *, const char *, const char *); save_sync_android_start(act->vm, g_root, act->internalDataPath); }   // save_sync_android.c: DM_SAVE_SYNC when Dropbox is set up
     snprintf(p, sizeof p, "%s/temp", act->internalDataPath); mkdir(p, 0700); setenv("DM_TEMP", p, 0);
     snprintf(p, sizeof p, "%s/shaders.dmsv", g_root); setenv("DM_VK_SHADERS", p, 0);
     snprintf(p, sizeof p, "%s/env.txt", g_root); env_file(p);

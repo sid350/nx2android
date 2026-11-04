@@ -47,6 +47,7 @@ GAME_MODE_CONFIG = ('game-mode-config', [(True, 'supportsPerformanceGameMode', T
 # (tag, [(ns_android?, name, value)], children)
 MANIFEST = ('manifest', [(False, 'package', PKG), (True, 'versionCode', ARGS.version_code), (True, 'versionName', ARGS.version_name)], [
     ('uses-sdk', [(True, 'minSdkVersion', MIN_SDK), (True, 'targetSdkVersion', TARGET_SDK)], []),
+    ('uses-permission', [(True, 'name', 'android.permission.INTERNET')], []),   # cloud saves over Dropbox (save_sync_android.c; used only when the player sets them up)
     ('uses-permission', [(True, 'name', 'android.permission.VIBRATE')], []),   # rumble and the touch gamepad's taps (a normal permission: granted at install)
     # Local play over the LAN (env.txt's DM_LAN=1, hle_ldn.c / hle_socket.c): sockets, the Wi-Fi address, and a multicast lock without which the Wi-Fi driver drops the broadcasts
     # other players scan with. All normal permissions (granted at install); a game with DM_LAN off opens no socket

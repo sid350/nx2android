@@ -1,0 +1,3 @@
+# Cloud saves over Dropbox (docs/SAVE_SYNC.md): devtools/dropbox_token.py writes this file as dropbox.txt
+app_key=
+refresh_token=

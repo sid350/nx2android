@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <sys/mman.h>
 
+// Darwin's name for a stat's modification time
+#define st_mtimespec st_mtim
 #ifndef MAP_ANON
 #define MAP_ANON MAP_ANONYMOUS
 #endif
