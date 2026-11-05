@@ -736,10 +736,12 @@ NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; uint64_t t0 = now_ns(); nvn_dr
 // replay jumped to 0x1000000003 (that CALL record's header) after 8 to 30 minutes of play
 #define OP_RESERVE 16
 
+static void hostseg_disown(cmd_t *o);
 NVN(nvnCommandBufferInitialize, NVNboolean, NVNcommandBuffer *c, NVNdevice *d) {
+    if (CB(c)->magic == MAGIC('C', 'M', 'D', 'B')) hostseg_disown(CB(c));   // initialized again without a Finalize
     memset(c, 0, sizeof(cmd_t)); CB(c)->magic = MAGIC('C', 'M', 'D', 'B'); CB(c)->dev = d; return 1;
 }
-NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { CB(c)->magic = 0; }
+NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { hostseg_disown(CB(c)); CB(c)->magic = 0; }
 NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) { CB(c)->cb = cb; }
 NVN(nvnCommandBufferSetMemoryCallbackData, void, NVNcommandBuffer *c, void *d) { CB(c)->cb_data = d; }
 static uint8_t *align8(uint8_t *p) { return (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7); }
@@ -781,33 +783,52 @@ static void cmd_new_segment(cmd_t *o, uint8_t *mem, size_t n) {
 // A segment is as large as the game asked for when it says (an empty pool with a length: HOSTSEG_MIN up to HOSTSEG_SZ), else HOSTSEG_SZ: Super Mario Odyssey entering the Wooded Kingdom
 // sets up tens of thousands of command buffers with an empty pool and 0x200 bytes each before recording into them, and at 256 KB apiece these (never reclaimed: no guest bytes to hang off)
 // reached the 1 GB cap within 3 seconds, every time; at 4 KB they come to 128 MB
+// Those segments have no guest range, so they belong to the command buffer they were lent to and come back when it is finalized or initialized again, HOSTSEG_GRACE frames later
+// (Odyssey lent 4 KB ones steadily while the kingdoms loaded and reached the 1 GB cap after 15 minutes of play, 52,500 frames). DM_NVN_HOSTSEG_KEEP=1 keeps them for good, as before
 #define HOSTSEG_SZ (256u << 10)
 #define HOSTSEG_MIN (4u << 10)
 #define HOSTSEG_CAP (1u << 30)
+#define HOSTSEG_GRACE 120
 uint64_t dm_nvn_frame_count(void);
-typedef struct { uint8_t *mem; uint64_t frame; int busy; uintptr_t org_lo, org_hi; uint32_t sz; } hostseg_t;   // org: the guest range of the recording it hangs off (0 = unknown, never reclaimed)
-static hostseg_t *g_hostseg; static int g_nhostseg, g_caphostseg; static uint64_t g_hostseg_bytes;
+typedef struct { uint8_t *mem; uint64_t frame; int busy; uintptr_t org_lo, org_hi; uint32_t sz; const cmd_t *owner; int owner_next; uint64_t dead_frame; } hostseg_t;   // org: the guest range of the recording it hangs off (0 = none: it belongs to owner, chained from the buffer's hostseg_head by index + 1); dead_frame: when it came back
+static hostseg_t *g_hostseg; static int g_nhostseg, g_caphostseg; static uint64_t g_hostseg_bytes, g_hostseg_back_cmds, g_hostseg_back_segs;
 static pthread_mutex_t g_hostseg_mu = PTHREAD_MUTEX_INITIALIZER;
 // Take a segment of sz bytes: origin = the current recording's guest bytes [BEGIN, end of JUMP); if the write pointer is already in a host segment (overflowing again), keep that segment's origin
-static uint8_t *hostseg_take(const cmd_t *o, uint32_t sz) {
-    static unsigned total; uint64_t f = dm_nvn_frame_count(); uint8_t *m = NULL;
+static uint8_t *hostseg_take(cmd_t *o, uint32_t sz) {
+    static unsigned total; uint64_t f = dm_nvn_frame_count(); uint8_t *m = NULL; int at = -1;
     uintptr_t lo = 0, hi = 0, cur = o ? (uintptr_t)o->cur : 0;
     pthread_mutex_lock(&g_hostseg_mu);
     int in_seg = 0;
     for (int i = 0; i < g_nhostseg && cur; i++) if (cur >= (uintptr_t)g_hostseg[i].mem && cur <= (uintptr_t)g_hostseg[i].mem + g_hostseg[i].sz) { lo = g_hostseg[i].org_lo; hi = g_hostseg[i].org_hi; in_seg = 1; break; }
     if (!in_seg && o && o->recording && o->cur) { lo = o->recording == 1 && o->begin && (uintptr_t)o->begin <= cur ? (uintptr_t)o->begin : cur; hi = cur + 16; }
     for (int i = 0; i < g_nhostseg && !m; i++)
-        if (!g_hostseg[i].busy && g_hostseg[i].sz == sz) { g_hostseg[i] = (hostseg_t){ g_hostseg[i].mem, f, 1, lo, hi, sz }; m = g_hostseg[i].mem; }
+        if (!g_hostseg[i].busy && g_hostseg[i].sz == sz && f >= g_hostseg[i].dead_frame + HOSTSEG_GRACE) { g_hostseg[i] = (hostseg_t){ .mem = g_hostseg[i].mem, .frame = f, .busy = 1, .org_lo = lo, .org_hi = hi, .sz = sz }; m = g_hostseg[i].mem; at = i; }
     if (!m && g_hostseg_bytes + sz <= HOSTSEG_CAP) {
         if (g_nhostseg == g_caphostseg) { g_caphostseg = g_caphostseg ? g_caphostseg * 2 : 64; g_hostseg = realloc(g_hostseg, sizeof *g_hostseg * (size_t)g_caphostseg); }
         m = malloc(sz); g_hostseg_bytes += sz;
-        g_hostseg[g_nhostseg++] = (hostseg_t){ m, f, 1, lo, hi, sz };
+        at = g_nhostseg; g_hostseg[g_nhostseg++] = (hostseg_t){ .mem = m, .frame = f, .busy = 1, .org_lo = lo, .org_hi = hi, .sz = sz };
     }
-    unsigned t = ++total; int n = g_nhostseg; unsigned mb = (unsigned)(g_hostseg_bytes >> 20);
+    if (m && o && !lo && !hi) { g_hostseg[at].owner = o; g_hostseg[at].owner_next = o->hostseg_head; o->hostseg_head = at + 1; }
+    unsigned t = ++total; int n = g_nhostseg; unsigned mb = (unsigned)(g_hostseg_bytes >> 20); unsigned long long bc = g_hostseg_back_cmds, bs = g_hostseg_back_segs;
     pthread_mutex_unlock(&g_hostseg_mu);
     if (!m) die("NVN command memory: the game's pool is empty and host-lent segments reached %u MB without being reclaimed by the game's blocks", HOSTSEG_CAP >> 20);
-    if (t == 1 || t % 1024 == 0) LOG("[nvn] the game's command memory ran short, the host lends a segment (%u times so far, frame %llu, segment pool %d segments, %u MB)", t, (unsigned long long)f, n, mb);
+    if (t == 1 || t % 1024 == 0) LOG("[nvn] the game's command memory ran short, the host lends a segment (%u times so far, frame %llu, segment pool %d segments, %u MB; back from finalized buffers: %llu segments of %llu buffers)", t, (unsigned long long)f, n, mb, bs, bc);
     return m;
+}
+// The buffer is finalized or initialized again: the segments lent to it with no guest range are dead. They are written again only HOSTSEG_GRACE frames on, past any submission still under way
+static void hostseg_disown(cmd_t *o) {
+    static int keep = -1; if (keep < 0) keep = getenv("DM_NVN_HOSTSEG_KEEP") != NULL;
+    if (keep || !o->hostseg_head) return;
+    uint64_t f = dm_nvn_frame_count(); int back = 0;
+    pthread_mutex_lock(&g_hostseg_mu);
+    for (int i = o->hostseg_head; i > 0 && i <= g_nhostseg && g_hostseg[i - 1].busy && g_hostseg[i - 1].owner == o; ) {
+        hostseg_t *s = &g_hostseg[i - 1]; i = s->owner_next; s->busy = 0; s->owner = NULL; s->owner_next = 0; s->dead_frame = f; back++;
+    }
+    if (back) { g_hostseg_back_cmds++; g_hostseg_back_segs += (uint64_t)back; }
+    unsigned long long first = g_hostseg_back_cmds == 1 && back;
+    pthread_mutex_unlock(&g_hostseg_mu);
+    o->hostseg_head = 0;
+    if (first) LOG("[nvn] a finalized command buffer gave back its first %d host-lent segment(s) (frame %llu)", back, (unsigned long long)f);
 }
 // The game gives out [lo, hi): segments whose recording's guest bytes overlap it are dead, reclaim them
 static void hostseg_release(uintptr_t lo, uintptr_t hi) {
