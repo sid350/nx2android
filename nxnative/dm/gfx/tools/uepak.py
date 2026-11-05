@@ -157,7 +157,7 @@ class R:
         if n < 0: return self.raw(-2 * n).decode('utf-16-le')[:-1]
         return self.raw(n)[:-1].decode('utf-8', 'replace') if n else ''
 
-LEGACY = (4, 8)   # legacy pak versions read (the per-file index); 11 has the encoded one
+LEGACY = (3, 4, 8)   # legacy pak versions read (the per-file index); 11 has the encoded one
 V8_METHOD_COUNTS = {0xac: 4, 0xcc: 5}   # footer magic offset from the end distinguishes UE4.22's v8A from v8B
 LEGACY_METHODS = {1: 'Zlib', 2: 'Gzip', 3: 'LZ5', 4: 'Custom'}   # compression flags of a legacy pak (3: DRAGON QUEST XI S's engine, see the header)
 ZLIB = {'Zlib': lambda b, n: zlib.decompress(b), 'Gzip': lambda b, n: zlib.decompress(b, 31)}   # the methods Pak.read decodes without the game
