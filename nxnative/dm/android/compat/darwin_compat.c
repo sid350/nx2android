@@ -5,6 +5,8 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <sys/clonefile.h>
 #include <sys/sysctl.h>
+#include <sys/system_properties.h>
+#include <sys/xattr.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -263,6 +265,18 @@ void CFDictionaryRemoveValue(CFMutableDictionaryRef d, const void *key) { size_t
 CFIndex CFDictionaryGetCount(CFDictionaryRef d) { return (CFIndex)d->n; }
 
 // ---------------- clonefile / renamex_np ----------------
+// As a real clone: a copy keeps the original's dates and its user xattrs. hle_fs.c keeps a case collision's guest name in one, so without it a Commit lost the name; save_sync.c hashes
+// the guest names and takes "which save is newer" from the dates.
+static int copy_meta(const char *src, const char *dst, const struct stat *st) {
+    char names[1024]; ssize_t n = llistxattr(src, names, sizeof names); int r = 0;
+    for (ssize_t o = 0; o < n && !r; o += (ssize_t)strlen(names + o) + 1) {
+        if (strncmp(names + o, "user.", 5)) continue;
+        char v[1024]; ssize_t k = lgetxattr(src, names + o, v, sizeof v);
+        if (k < 0 || lsetxattr(dst, names + o, v, (size_t)k, 0)) r = -1;
+    }
+    struct timespec t[2] = {st->st_atim, st->st_mtim};
+    return utimensat(AT_FDCWD, dst, t, 0) ? -1 : r;
+}
 static int copy_file(const char *src, const char *dst, mode_t mode) {
     int in = open(src, O_RDONLY | O_CLOEXEC); if (in < 0) return -1;
     int out = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode & 07777);
@@ -275,7 +289,7 @@ static int copy_file(const char *src, const char *dst, mode_t mode) {
 int clonefile(const char *src, const char *dst, uint32_t flags) {
     struct stat st; if ((flags & CLONE_NOFOLLOW ? lstat : stat)(src, &st)) return -1;
     if (!access(dst, F_OK)) { errno = EEXIST; return -1; }
-    if (!S_ISDIR(st.st_mode)) return copy_file(src, dst, st.st_mode);
+    if (!S_ISDIR(st.st_mode)) return copy_file(src, dst, st.st_mode) ? -1 : copy_meta(src, dst, &st);
     if (mkdir(dst, st.st_mode & 07777)) return -1;
     DIR *d = opendir(src); if (!d) return -1;
     struct dirent *e; int r = 0;
@@ -284,7 +298,8 @@ int clonefile(const char *src, const char *dst, uint32_t flags) {
         char a[PATH_MAX], b[PATH_MAX]; snprintf(a, sizeof a, "%s/%s", src, e->d_name); snprintf(b, sizeof b, "%s/%s", dst, e->d_name);
         r = clonefile(a, b, flags);
     }
-    int er = errno; closedir(d); errno = er; return r;
+    int er = errno; closedir(d); errno = er;
+    return r ? r : copy_meta(src, dst, &st);   // last: the files made in it changed the folder's date
 }
 int renamex_np(const char *from, const char *to, unsigned flags) {
     unsigned lf = (flags & RENAME_SWAP ? 2u /* RENAME_EXCHANGE */ : 0) | (flags & RENAME_EXCL ? 1u /* RENAME_NOREPLACE */ : 0);
@@ -306,4 +321,10 @@ int sysctl(int *name, unsigned namelen, void *old, size_t *oldlen, void *newp, s
     kp->kp_proc.p_starttime.tv_sec = (time_t)at; kp->kp_proc.p_starttime.tv_usec = (suseconds_t)((at - (double)(time_t)at) * 1e6);
     *oldlen = sizeof *kp; return 0;
 }
-int sysctlbyname(const char *name, void *old, size_t *oldlen, void *newp, size_t newlen) { (void)name; (void)old; (void)oldlen; (void)newp; (void)newlen; errno = ENOENT; return -1; }
+int sysctlbyname(const char *name, void *old, size_t *oldlen, void *newp, size_t newlen) {
+    (void)newp; (void)newlen;
+    if (!strcmp(name, "hw.machine") && old && oldlen && *oldlen) {   // the device's name in a cloud save (save_sync.c)
+        char v[PROP_VALUE_MAX]; if (__system_property_get("ro.product.model", v) > 0) { snprintf(old, *oldlen, "%s", v); *oldlen = strlen(old) + 1; return 0; }
+    }
+    errno = ENOENT; return -1;
+}

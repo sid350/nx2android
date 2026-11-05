@@ -8,6 +8,8 @@
 #include <mach/mach.h>
 #include "front.h"
 #include "packfs.h"
+#include "save_sync.h"
+__attribute__((weak)) void front_save_sync_check(void) {}   // Android: asks whether to play on when the cloud's save could not be read (save_sync_android.c)
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -535,6 +537,8 @@ HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv; save data 
     const char *d = getenv("DM_SAVE");
     if (!d) die("DM_SAVE is not set: point it at a writable copy of a save directory");
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;   // strip trailing slashes (.work / .new are appended at the same level)
+    save_sync_mount(dd, DM_GAME_ID);   // DM_SAVE_SYNC: the cloud's save comes in before the work directory is cloned from the committed one (save_sync.h)
+    front_save_sync_check();
     return mount_ex(name, dd, 0, 1);
 }
 // Device save data: one save for the console instead of one per user. Animal Crossing: New Horizons keeps its island there (3.0.3's main mounts no account save data at all); the host
@@ -547,6 +551,8 @@ HLE_FORCE("_ZN2nn2fs19MountDeviceSaveDataEPKc", "fsp-srv; device save data → t
     const char *d = getenv("DM_SAVE");
     if (!d) die("DM_SAVE is not set: point it at a writable copy of a save directory");
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;
+    save_sync_mount(dd, DM_GAME_ID);   // the cloud's save holds both, so it comes in at whichever of the two mounts first
+    front_save_sync_check();
     strlcat(dd, "_device", sizeof dd);
     return mount_ex(name, dd, 0, 1);
 }
@@ -556,6 +562,13 @@ HLE_FORCE("_ZN2nn2fs20ExtendDeviceSaveDataEll", "fsp-srv; extend device save dat
 HLE_FORCE("_ZN2nn2fs22GetSaveDataRestoreFlagEPbPKc", "fsp-srv; save data restored from a backup: never", Result, h_fs_RestoreFlag, uint8_t *out, const char *name) { (void)name; *out = 0; return RES_OK; }
 static _Atomic uint64_t g_save_commits;   // number of successful commits (used by the front end when going to background to wait for "the game's current save has been committed")
 uint64_t dm_fs_commit_count(void) { return atomic_load(&g_save_commits); }
+// The cloud sender's copy of a committed save (save_sync.c): a Commit holds both locks for its clone and swap, so the clone taken under them is one whole committed version
+int dm_fs_clone_committed(const char *dir, const char *to) {
+    PATH_LOCK(); pthread_mutex_lock(&g_lock);
+    int r = clonefile(dir, to, 0) ? -1 : 0, e = errno;
+    pthread_mutex_unlock(&g_lock);
+    errno = e; return r;
+}
 // Both Commit overloads share this transaction engine. Caller holds the path
 // and mount locks; front-end failure notification is delivered after unlocking.
 static Result commit_mount_locked(int i, int *notify_error) {
@@ -595,6 +608,7 @@ static Result commit_mount_locked(int i, int *notify_error) {
     static int n; if (r == RES_OK) { uint64_t tc2 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
         LOG("save commit #%d: %s swapped atomically into %s (%d save writes so far) (clone + swap %llu us, since this transaction's first write %llu us)", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
             (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0)); atomic_fetch_add(&g_save_commits, 1);
+        save_sync_committed();   // wakes the cloud sender, which clones the committed save through dm_fs_clone_committed above (save_sync.h)
     }
     return r;
 }

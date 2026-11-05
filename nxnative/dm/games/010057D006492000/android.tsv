@@ -10,3 +10,5 @@ package	org.nx2a.t010057d006492000
 orientation	landscape
 # --large-text: the Latin text fonts (menus, dialogue, the title's prompts), from the game's paks into a patch pak mounted over them
 large_text	Kingship/Content/Paks/Kingship-Switch_9_P.pak Kingship/Content/UI/Font/KS_Meldir_B.ufont Kingship/Content/UI/Font/KS_Meldir_Default.ufont Kingship/Content/UI/Font/KS_NewCinema_Std_D.ufont Kingship/Content/UI/Font/KS_Skech_B.ufont Kingship/Content/UI/Font/KS_Skech_Default.ufont Kingship/Content/UI/Font/KS_Skech_I.ufont
+env	DM_ADAPTIVE_FPS=0
+env	DM_VK_CB_DRAWS=32
