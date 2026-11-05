@@ -96,8 +96,9 @@ class AndroidProfile:
         return dict(v.split('=', 1) for v in self.values('setting'))
 
     @property
-    def env(self):   # ['KEY=VALUE', ...]
-        return self.values('env')
+    def env(self):   # ['KEY=VALUE', ...]; this fork turns DM_GPU_TURBO on for every game until upstream has something better (an env row of the profile's own, =0 for one, wins)
+        rows = self.values('env')
+        return rows if any(r.startswith('DM_GPU_TURBO=') for r in rows) else [*rows, 'DM_GPU_TURBO=1']
 
     def overlay_table(self):
         """The gamepad layouts: the default ones with this profile's moves (a moved control's x is a fraction of the window's width: its anchor, no offset)"""
