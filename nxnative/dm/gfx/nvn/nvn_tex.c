@@ -80,7 +80,11 @@ static uint64_t level_walk(const nvn_texdesc *d, unsigned level, unsigned dpl, u
                            unsigned tileH, unsigned tileD, fmt_t t, uint32_t *gobs) {
     uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
     uint32_t tw = 128u >> (tileH + tileD); if (!tw) tw = 1;   // GOB columns of a 64 KB tile
-    int tiled = sparse_of(d);   // still in a sparse texture's tiled levels
+    // Still in a sparse texture's tiled levels. A texture too small for its format's tile took the automatic block height (nvn_tex_layout) and is all mip tail, whatever tile that height
+    // would make: OCTOPATH TRAVELER's 383×78 RGBA8 save slot plate (tile 128 rows) reads as 24 GOBs × 2 × 8 GOBs, 3 tiles; padded to 32 columns, its second block row came out shifted
+    // and its last 8 columns read past the data (the noise at the plate's lower right)
+    int sth = sparse_tile_h(t.bpb);
+    int tiled = sparse_of(d) && (d->pkg_block_h || dpl != 2 || sth < 0 || tileH == (unsigned)sth);
     uint64_t off = 0;
     for (unsigned i = 0;; i++) {
         uint32_t lw = blk(mip(w * sx, i), t.bw);

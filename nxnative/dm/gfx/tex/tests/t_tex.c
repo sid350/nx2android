@@ -126,6 +126,10 @@ int main(void) {
         d.flags = 0; nvn_tex_layout(&d, &L);   // the same texture not sparse keeps the packed layout
         CHECK(nvn_tex_level_offset(&d, 1) == 0x81000 && L.size == 0xBC400 && nvn_tex_level_gobs(&d, 0) == 43, "S not sparse: level 1 %#llx storage %#llx, expected 0x81000 / 0xbc400",
               (unsigned long long)nvn_tex_level_offset(&d, 1), (unsigned long long)L.size);
+        // OCTOPATH TRAVELER's save slot plate, RGBA8 383×78: lower than the tile's 128 rows, so all mip tail: 24 GOBs × 2 rows of 8-GOB blocks, its 3 tiles' worth of data in the game's file
+        nvn_texdesc p = {1, 0x25, 0x20, 0, 383, 78, 1, 1, 0, 0}; nvn_tex_layout(&p, &L);
+        CHECK(L.tileH == 3 && nvn_tex_level_gobs(&p, 0) == 24 && L.size == 0x30000, "S 383×78 sparse: block height %u, %u GOBs wide, storage %#llx, expected 3 / 24 / 0x30000",
+              L.tileH, nvn_tex_level_gobs(&p, 0), (unsigned long long)L.size);
     }
 
     printf("%s: %d/%d checks passed\n", fails ? "RED" : "all passed", checks - fails, checks);
