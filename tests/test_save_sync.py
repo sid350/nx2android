@@ -79,5 +79,77 @@ int main(int c, char **v) { char a[4096], b[4096], x[16] = {0}; struct stat s; s
             self.assertEqual(r, 0)
 
 
+@unittest.skipUnless(sys.platform == 'linux' and shutil.which('cc'), 'Linux and a host C compiler required')
+class OldBackslashNames(unittest.TestCase):
+    """A save another host wrote before backslashes separated paths (seedds/nxnative 7c23cc0, abd7014): save:\\savedata0.bin was the file "\\savedata0.bin". hle_fs.c's mount renames it
+    to the name the game asks for, and a backslash path reaches the same file a slash path does, so a save from an iPhone or a Mac and one from Android are the same files."""
+    def test_mount_renames_and_backslash_paths_resolve(self):
+        fs = (ROOT / 'nxnative/dm/host/hle_fs.c').read_text()
+        compat = (ROOT / 'nxnative/dm/android/compat/darwin_compat.c').read_text()
+        part = fs[fs.index('typedef struct { char name[0x301]'):fs.index('static Result err_res(')]
+        clone = compat[compat.index('// ---------------- clonefile'):compat.index('int renamex_np')]
+        code = r'''
+#define _GNU_SOURCE
+#include <assert.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/clonefile.h>
+#include <sys/xattr.h>
+#include <time.h>
+#include <unistd.h>
+typedef uint32_t Result;
+#define RES_OK 0
+#define RES_FAIL 1
+#define LOG(...) (fprintf(stderr, __VA_ARGS__), fputc('\n', stderr))
+static void die(const char *f, ...) { fprintf(stderr, "die: %s\n", f); exit(70); }
+#define RES_PATH_NOT_FOUND 0x202u
+#define MAX_MOUNT 8
+#define CLONE_NOFOLLOW 1
+''' + clone + r'''
+static int rm_tree(const char *p) { char c[4200]; snprintf(c, sizeof c, "rm -rf '%s'", p); return system(c); }
+static void put(const char *p, const char *s) { FILE *f = fopen(p, "w"); assert(f); fputs(s, f); fclose(f); }
+static int has(const char *p, const char *s) { char b[64] = {0}; FILE *f = fopen(p, "r"); if (!f) return 0; size_t k = fread(b, 1, sizeof b - 1, f); fclose(f); b[k] = 0; return !strcmp(b, s); }
+''' + part + r'''
+int main(int c, char **v) {
+    char d[2048], p[2048], hp[1024]; int ro;
+    snprintf(d, sizeof d, "%s/save", v[1]); mkdir(d, 0755);
+    snprintf(p, sizeof p, "%s/\\savedata0.bin", d); put(p, "old");           // Link's Awakening's save from a host before 7c23cc0
+    snprintf(p, sizeof p, "%s/\\dir\\f", d); put(p, "nested");
+    snprintf(p, sizeof p, "%s/\\taken", d); put(p, "stale");               // its new name is taken: it stays
+    snprintf(p, sizeof p, "%s/taken", d); put(p, "new");
+    snprintf(p, sizeof p, "%s/\\..\\up", d); put(p, "up");                  // would leave its folder: it stays
+    if (setxattr(d, "user.probe", "x", 1, 0, 0)) return 77;
+    if (mount_ex("save", d, 0, 1) != RES_OK) return 1;
+    snprintf(p, sizeof p, "%s/savedata0.bin", d); if (!has(p, "old")) return 2;
+    snprintf(p, sizeof p, "%s/dir/f", d); if (!has(p, "nested")) return 3;
+    snprintf(p, sizeof p, "%s/\\taken", d); if (!has(p, "stale")) return 4;
+    snprintf(p, sizeof p, "%s/taken", d); if (!has(p, "new")) return 5;
+    snprintf(p, sizeof p, "%s/\\..\\up", d); if (!has(p, "up")) return 6;
+    if (!host_path("save:\\savedata0.bin", hp, sizeof hp, &ro) || !has(hp, "old")) return 7;   // backslash and slash paths reach the same file
+    if (!host_path("save:/savedata0.bin", hp, sizeof hp, &ro) || !has(hp, "old")) return 8;
+    if (!host_path("save:\\dir\\f", hp, sizeof hp, &ro) || !has(hp, "nested")) return 9;
+    if (!host_path_ex("save:\\dir\\g", hp, sizeof hp, &ro, 1)) return 10;   // a file the game makes with a backslash path lands in dir/
+    put(hp, "made"); snprintf(p, sizeof p, "%s.work/dir/g", d); if (!has(p, "made")) return 11;
+    return 0; }
+'''
+        with tempfile.TemporaryDirectory() as d:
+            src, exe = Path(d) / 't.c', Path(d) / 't'
+            src.write_text(code)
+            subprocess.run(['cc', '-w', '-I', ROOT / 'nxnative/dm/android/compat/include', '-o', exe, src], check=True)
+            r = subprocess.run([exe, d], capture_output=True, text=True)
+            if r.returncode == 77: self.skipTest('no user xattrs on this file system')
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()

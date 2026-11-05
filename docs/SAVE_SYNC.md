@@ -37,6 +37,7 @@ The saves are `/Saves/<title ID>/save.dmsync` from the root of the Dropbox app's
 
 - If you play on after that dialog, the game runs with the older save it has. Saving in that run sends the older save over the newer one; the newer one is kept only in this device's backups. An iPhone using the Dropbox app's folder, without the patch above, does the same with no question: seen once. If the game shows old progress, close it without saving and start it again.
 - Deleting part of a save counts as a change, and it goes out.
+- A game that names its save with backslashes (Link's Awakening: `save:\savedata0.bin`) has the same files on every device only when every host splits paths at backslashes, as Horizon does: nxnative since 7c23cc0 and this fork since this change. An older save holding such a name as one file (`\savedata0.bin`) is renamed at mount to the name the game asks for (nxnative abd7014), so a save from an older Android build, a Mac or an iPhone is found again. An Android build from before this change cannot read a save renamed this way.
 - Only one device should play at a time: a game left open on another device can send its save over this one.
 
 The log (`log.txt`) has what happened, on the lines starting `save sync:`. The tokens are never written there.
