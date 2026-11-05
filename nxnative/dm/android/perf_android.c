@@ -27,15 +27,15 @@ static struct {
     int (*update)(APerformanceHintSession *, int64_t);
     int (*report)(APerformanceHintSession *, int64_t);
     int (*set_threads)(APerformanceHintSession *, const int32_t *, size_t);
-    // Android 15: the frame's GPU time beside its CPU time (the GPU's clock follows it too)
+    // Android 15: the frame's GPU time beside its CPU time (the GPU's clock follows it too), and the session out of power-efficiency mode
     int (*report2)(APerformanceHintSession *, AWorkDuration *);
-    AWorkDuration *(*wd_create)(void);
+    int (*prefer_eff)(APerformanceHintSession *, bool);
+    AWorkDuration *(*wd_create)(void); void (*wd_release)(AWorkDuration *);
     void (*wd_start)(AWorkDuration *, int64_t); void (*wd_total)(AWorkDuration *, int64_t); void (*wd_cpu)(AWorkDuration *, int64_t); void (*wd_gpu)(AWorkDuration *, int64_t);
     // Android 16: a load that rises now, for the clocks to follow at once rather than over the next frames
     int (*increase)(APerformanceHintSession *, bool cpu, bool gpu, const char *name);
 } H;
 static APerformanceHintSession *g_hint; static int64_t g_hint_target; static int32_t g_hint_tids[8]; static int g_hint_n;
-static AWorkDuration *g_wd;   // made once, its fields set for each frame's report
 
 static int64_t perf_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }
 
@@ -46,16 +46,17 @@ static void hint_init(int64_t target) {
     H.get = dlsym(lib, "APerformanceHint_getManager"); H.create = dlsym(lib, "APerformanceHint_createSession");
     H.update = dlsym(lib, "APerformanceHint_updateTargetWorkDuration"); H.report = dlsym(lib, "APerformanceHint_reportActualWorkDuration");
     H.set_threads = dlsym(lib, "APerformanceHint_setThreads");   // Android 14
-    H.report2 = dlsym(lib, "APerformanceHint_reportActualWorkDuration2");   // Android 15
-    H.wd_create = dlsym(lib, "AWorkDuration_create");
+    H.report2 = dlsym(lib, "APerformanceHint_reportActualWorkDuration2"); H.prefer_eff = dlsym(lib, "APerformanceHint_setPreferPowerEfficiency");   // Android 15
+    H.wd_create = dlsym(lib, "AWorkDuration_create"); H.wd_release = dlsym(lib, "AWorkDuration_release");
     H.wd_start = dlsym(lib, "AWorkDuration_setWorkPeriodStartTimestampNanos"); H.wd_total = dlsym(lib, "AWorkDuration_setActualTotalDurationNanos");
     H.wd_cpu = dlsym(lib, "AWorkDuration_setActualCpuDurationNanos"); H.wd_gpu = dlsym(lib, "AWorkDuration_setActualGpuDurationNanos");
-    if (!H.wd_create || !H.wd_start || !H.wd_total || !H.wd_cpu || !H.wd_gpu || !(H.report2 && (g_wd = H.wd_create()))) H.report2 = NULL;
+    if (!H.wd_create || !H.wd_release || !H.wd_start || !H.wd_total || !H.wd_cpu || !H.wd_gpu) H.report2 = NULL;
     H.increase = dlsym(lib, "APerformanceHint_notifyWorkloadIncrease");   // Android 16
     if (!H.get || !H.create || !H.report) { LOG("[perf] no APerformanceHint on this Android: CPU hints off"); return; }
     APerformanceHintManager *m = H.get(); if (!m) return;
     g_hint_tids[0] = (int32_t)gettid(); g_hint_n = 1;
     g_hint = H.create(m, g_hint_tids, (size_t)g_hint_n, target); g_hint_target = target;
+    if (g_hint && H.prefer_eff) H.prefer_eff(g_hint, false);
     LOG("[perf] ADPF session %s (target %.2f ms, thread %d; GPU time %s, load increases %s)", g_hint ? "open" : "refused", target / 1e6, g_hint_tids[0],
         H.report2 ? "reported" : "not reported", H.increase ? "signalled" : "not signalled");
 }
@@ -71,6 +72,38 @@ static uint64_t task_ticks(int tid) {
     unsigned long long ut = 0, st = 0; int field = 2;
     for (char *t = c + 1; *t && field < 15; t++) if (*t == ' ') { field++; if (field == 14) ut = strtoull(t + 1, NULL, 10); else if (field == 15) st = strtoull(t + 1, NULL, 10); }
     return ut + st;
+}
+// Thread placement (on unless DM_PIN_GAME=0; live, looked at with the threads every 300 frames): the two threads that used the most CPU since the last
+// look go to the cores of the highest clock ceiling at that moment, every other thread of the process to the remaining cores. The ceiling is
+// scaling_max_freq, which the vendor's power policy lowers per app and per cluster: the Red Magic Astra's 8 Elite (cores 0-5 up to 3.53 GHz, prime 6-7
+// up to 4.32) had 6-7 held at 1.0-1.7 GHz while 0-5 had 1.8, so the ceilings are read again each time and a cap on the prime cores moves the two off them.
+// Left to the scheduler, Castlevania: Belmont's Curse there made 13-45 double-length frames per 1000 in fights; placed, 0-1.4 (2026-11-01)
+static void pin_game_threads(const int32_t *tids, const uint64_t *used, int n) {
+    long nc = sysconf(_SC_NPROCESSORS_CONF); if (nc > 32) nc = 32;
+    static int on;
+    const char *e = getenv("DM_PIN_GAME"); int v = !(e && *e && atoi(e) == 0);
+    if (v != on) {
+        LOG("[perf] DM_PIN_GAME %s", v ? "on" : "off");
+        if (!v) { cpu_set_t all; CPU_ZERO(&all); for (long c = 0; c < nc; c++) CPU_SET(c, &all); for (int i = 0; i < n; i++) sched_setaffinity(tids[i], sizeof all, &all); }
+        on = v;
+    }
+    if (!on || n <= 0) return;
+    long cap[32] = {0}, hi = 0, lo = 0;
+    for (long c = 0; c < nc; c++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%ld/cpufreq/scaling_max_freq", c); FILE *f = fopen(p, "r");
+        if (f) { if (fscanf(f, "%ld", &cap[c]) != 1) cap[c] = 0; fclose(f); } cap[c] /= 1000; if (cap[c] > hi) hi = cap[c]; if (cap[c] && (!lo || cap[c] < lo)) lo = cap[c]; }
+    cpu_set_t fast, rest; CPU_ZERO(&fast); CPU_ZERO(&rest); int nf = 0;
+    for (long c = 0; c < nc; c++) { if (hi && cap[c] == hi) { CPU_SET(c, &fast); nf++; } else CPU_SET(c, &rest); }
+    if (!hi || hi == lo || nf * 2 > nc) for (long c = 0; c < nc; c++) CPU_SET(c, &rest);   // all alike, or the fast ones the majority: the rest keep every core
+    int top[2] = {-1, -1};
+    for (int i = 0; i < n; i++) { if (top[0] < 0 || used[i] > used[top[0]]) { top[1] = top[0]; top[0] = i; } else if (top[1] < 0 || used[i] > used[top[1]]) top[1] = i; }
+    for (int i = 0; i < n; i++) sched_setaffinity(tids[i], sizeof fast, i == top[0] || i == top[1] ? &fast : &rest);
+    static int32_t was_top[2]; static long was_hi;
+    int32_t t0 = top[0] >= 0 ? tids[top[0]] : 0, t1 = top[1] >= 0 ? tids[top[1]] : 0;
+    if (t0 != was_top[0] || t1 != was_top[1] || hi != was_hi) {
+        was_top[0] = t0; was_top[1] = t1; was_hi = hi;
+        char l[96]; size_t o = 0; for (long c = 0; c < nc; c++) if (CPU_ISSET(c, &fast)) o += snprintf(l + o, sizeof l - o, " %ld", c);
+        LOG("[perf] DM_PIN_GAME: threads %d and %d on CPUs%s (ceiling %ld MHz, lowest %ld)", t0, t1, l, hi, lo);
+    }
 }
 static void hint_threads_scan(int32_t self) {
     static struct { int tid; uint64_t ticks; } prev[512]; static int np; static int64_t last;
@@ -94,6 +127,12 @@ static void hint_threads_scan(int32_t self) {
             if (best < 0) break;
             pick[npick++] = cur[best].tid;
         }
+    }
+    if (secs > 0) {   // DM_PIN_GAME: the CPU each thread used since the last look
+        static int32_t tids[512]; static uint64_t used[512];
+        for (int i = 0; i < nc; i++) { uint64_t was = 0; for (int j = 0; j < np; j++) if (prev[j].tid == cur[i].tid) { was = prev[j].ticks; break; }
+            tids[i] = cur[i].tid; used[i] = cur[i].used > was ? cur[i].used - was : 0; }
+        pin_game_threads(tids, used, nc);
     }
     np = 0; for (int i = 0; i < nc; i++) { prev[np].tid = cur[i].tid; prev[np].ticks = cur[i].used; np++; }
     if (!g_hint || !H.set_threads) return;
@@ -156,15 +195,13 @@ void dm_perf_frame_cost(int64_t replay_ns, int64_t gpu_ns) { g_frame_cost = repl
 // The frame's work to the CPU hint: with the GPU's time where Android 15 takes it, and a load increase signalled (Android 16) when 3 frames in a row run over
 // the period, at most every 0.5 s: the clocks then follow the whole frame and not only its CPU half. (Super Mario Odyssey on the Red Magic Astra fell from 60
 // to 30-45 fps with the GPU at 222-443 MHz in the same scene; that device's GPU clock moved only with its FULL performance mode or its game menu, hints or not)
-// pq: the wait for the present thread, left out of the CPU time where the GPU's time goes beside it (blocked, not CPU work); pace: the part of it that is a
-// longer step's pacing, left out of the work judged over the period (counted, every frame at 40 or 30 fps was over the game's period and signalled)
-static void hint_report(int64_t w, int64_t pq, int64_t pace, int64_t now, int64_t target) {
+static void hint_report(int64_t w, int64_t now, int64_t target) {
     if (H.report2) {
-        AWorkDuration *d = g_wd;
-        H.wd_start(d, now - w); H.wd_total(d, w); H.wd_cpu(d, w > pq ? w - pq : 0); H.wd_gpu(d, g_frame_gpu > 0 ? g_frame_gpu : 0); if (H.report2(g_hint, d)) H.report(g_hint, w);
+        AWorkDuration *d = H.wd_create();
+        if (d) { H.wd_start(d, now - w); H.wd_total(d, w); H.wd_cpu(d, w); H.wd_gpu(d, g_frame_gpu > 0 ? g_frame_gpu : 0); if (H.report2(g_hint, d)) H.report(g_hint, w); H.wd_release(d); }
     } else H.report(g_hint, w);
     static int over; static int64_t last;
-    int64_t worst = w - pace > g_frame_gpu ? w - pace : g_frame_gpu;
+    int64_t worst = w > g_frame_gpu ? w : g_frame_gpu;
     over = worst > target * 105 / 100 ? over + 1 : 0;
     if (H.increase && over >= 3 && now - last > 500000000ll) {
         last = now; int r = H.increase(g_hint, true, g_frame_gpu > target * 70 / 100, "frame over its period");
@@ -232,8 +269,7 @@ static void adapt_frame(int64_t work, int64_t now) {
 // the clock a slow main thread needs
 // pq_ns: the wait for the present thread (hle_nvn.c), left out of the work the adaptive rate judges (at 40 or 30 fps it is the longer period's pace, and counted
 // it held the rate down for good) but kept in the work the CPU hint gets (with the replay on its own thread it is the replay's and the GPU's time as well:
-// left out, Super Mario Odyssey's hint saw light frames and the clocks stayed at 1-2 GHz). At 60 fps it is not a pace but the display or the swapchain
-// holding the frames back, and it stays in the work, or the rate could not step down for it
+// left out, Super Mario Odyssey's hint saw light frames and the clocks stayed at 1-2 GHz)
 static int64_t g_prev_present, g_pace, g_pq;
 void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { g_work_start = perf_now(); g_pace = (int64_t)pace_ns; g_pq = (int64_t)pq_ns; }
 // Called on the presenting thread right before a present; period in seconds (1/60, 1/30, ...).
@@ -245,8 +281,7 @@ void dm_perf_frame(double period) {
     hint_init(p);
     if (g_work_start) {   // (a longer span: the game was held, by the pause menu or the background)
         int64_t w = g_prev_present ? t - g_prev_present - g_pace : t - g_work_start;
-        int64_t pq = g_prev_present ? g_pq : 0, pace = g_step > 0 ? pq : 0;   // (t - g_work_start starts after the wait already)
-        if (w > 0 && w < 250000000) { adapt_frame(w - pace > 0 ? w - pace : 0, t); if (g_hint) hint_report(w, pq, pace, t, g_hint_target); }
+        if (w > 0 && w < 250000000) { adapt_frame(w - g_pq > 0 ? w - g_pq : 0, t); if (g_hint) hint_report(w, t, g_hint_target); }
         g_work_start = 0;
     }
     g_prev_present = t;

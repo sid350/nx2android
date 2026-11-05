@@ -13,3 +13,6 @@ status	playable
 tested	v327680 Lenovo Legion Y700 TB322FC (Snapdragon 8 Elite, Adreno 830, Android 16)
 package	org.nx2a.metroiddread
 orientation	landscape
+# Red Magic Astra (Snapdragon 8 Elite), local: what held 60 fps there (issue #11); see 0100000000010000/android.tsv
+env	DM_ADAPTIVE_FPS=0
+env	DM_VK_CB_DRAWS=32
