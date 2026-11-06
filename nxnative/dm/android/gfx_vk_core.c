@@ -294,6 +294,14 @@ void vk_init(void) {
     vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)p_vkGetInstanceProcAddr(V.inst, "vkGetDeviceProcAddr");
 #define VK_LOADD(f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f); if (!f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f "KHR"); if (!f) f = (PFN_##f)p_vkGetInstanceProcAddr(V.inst, #f);   // a promoted function by its extension's name (Vulkan 1.1 / 1.2 devices)
     VK_DEV_FNS(VK_LOADD)
+    // A driver can report the timeline-semaphore feature (and Vulkan 1.3) and still export no vkWaitSemaphores: the emulator's ranchu / gfxstream driver does
+    // (both the device and the instance dispatcher return null for it and for vkGetSemaphoreCounterValue), and the first wait then called address 0
+    // (SIGSEGV pc=0, lr=wait_fence+0x70, thread 'dm-vk-complete', South Park: The Stick of Truth). The feature query is not proof the entry points load:
+    // without them the fence ring is used for both the submit and the wait, which V.has_timeline decides.
+    if (V.has_timeline && (!vkWaitSemaphores || !vkGetSemaphoreCounterValue)) {
+        VKLOG("[vk] timeline semaphores reported but vkWaitSemaphores / vkGetSemaphoreCounterValue did not load: submissions signal fences");
+        V.has_timeline = 0;
+    }
     { void vk_dq_init(void); vk_dq_init(); }   // DM_VK_MT_REPLAY: the vkCmd* calls through the recorder thread (gfx_vk_dq.c)
     vkGetDeviceQueue(V.dev, V.qf, 0, &V.q);
     VkPipelineCacheCreateInfo pci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
@@ -331,7 +339,9 @@ void vk_pipeline_cache_save(void) {
 }
 
 // ---------------- memory pools ----------------
-#define MAXPOOL 4096
+// DARK SOULS: REMASTERED made more than 4,096 pools within 3 s of boot (FromSoftware's engine gives many resources a small pool of its own: 0x1000, 0x12000 bytes), which stopped it
+// with "too many memory pools"; the index (g_pool_ord) is 16-bit, so up to 65,535
+#define MAXPOOL 32768
 static vkpool_t g_pool[MAXPOOL]; static int g_npool;
 static pthread_rwlock_t g_pool_mu = PTHREAD_RWLOCK_INITIALIZER;
 static uint32_t g_pool_gen;   // bumped under the write lock when a pool is added or removed: vk_pool_of's per-thread cache holds while it is unchanged
@@ -339,8 +349,17 @@ static uint32_t g_pool_gen;   // bumped under the write lock when a pool is adde
 // cache was 18% of the profiler's samples of Super Mario Bros. Wonder's replay in its first level (a draw looks up more pools than the cache holds); with the
 // search its world map's replay took 4.2 ms a frame instead of 4.6-4.9
 static uint16_t g_pool_ord[MAXPOOL];
-static int pool_ord_cmp(const void *a, const void *b) { uint64_t x = g_pool[*(const uint16_t *)a].lo, y = g_pool[*(const uint16_t *)b].lo; return x < y ? -1 : x > y; }
-static void pool_ord_make(void) { for (int i = 0; i < g_npool; i++) g_pool_ord[i] = (uint16_t)i; qsort(g_pool_ord, (size_t)g_npool, sizeof *g_pool_ord, pool_ord_cmp); }
+// The index kept in order one pool at a time (sorting it whole at every add is O(n log n) a pool, which thousands of pools made slow): pool k (just appended) goes in at its place
+static void pool_ord_insert(int k) {
+    int lo = 0, hi = k; uint64_t a = g_pool[k].lo;
+    while (lo < hi) { int m = (lo + hi) / 2; if (g_pool[g_pool_ord[m]].lo <= a) lo = m + 1; else hi = m; }
+    memmove(g_pool_ord + lo + 1, g_pool_ord + lo, (size_t)(k - lo) * sizeof *g_pool_ord); g_pool_ord[lo] = (uint16_t)k;
+}
+// pool i removed and the last pool (index g_npool, already decremented) moved into its place: i leaves the index and the moved pool's entry takes index i
+static void pool_ord_remove(int i) {
+    int n = g_npool + 1, w = 0;
+    for (int r = 0; r < n; r++) { uint16_t v = g_pool_ord[r]; if (v == i) continue; g_pool_ord[w++] = v == g_npool ? (uint16_t)i : v; }
+}
 static int recv_fds(int sock, int *fds, int max) {
     char data[4096], ctl[CMSG_SPACE(sizeof(int) * 16)]; struct iovec iov = {data, sizeof data};
     struct msghdr m = {0}; m.msg_iov = &iov; m.msg_iovlen = 1; m.msg_control = ctl; m.msg_controllen = sizeof ctl;
@@ -483,8 +502,10 @@ static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t
             VKCHK(pool_copied_alloc(p, size, 0));
         }
     }
-    g_npool++; pool_ord_make(); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+    pool_ord_insert(g_npool++); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+    int np = g_npool;
     pthread_rwlock_unlock(&g_pool_mu);
+    if (np >= 1024 && !(np & (np - 1))) VKLOG("%d memory pools live", np);
     static uint64_t zc_bytes, cp_bytes; if (zc) cp_bytes += size; else zc_bytes += size;
     static int nlog; if (nlog++ < 24) VKLOG("memory pool %p +%#llx: %s (zero-copy %.1f MB, copied %.1f MB)", mem, (unsigned long long)size, zc ? "copied" : "zero-copy", zc_bytes / 1048576.0, cp_bytes / 1048576.0);
 }
@@ -493,7 +514,7 @@ void mtl_pool_del(const void *mem) {
         pthread_rwlock_wrlock(&g_pool_mu);
         int i = 0; while (i < g_npool && g_pool[i].base != (uint64_t)(uintptr_t)mem) i++;
         if (i == g_npool) { pthread_rwlock_unlock(&g_pool_mu); return; }
-        vkpool_t p = g_pool[i]; g_pool[i] = g_pool[--g_npool]; pool_ord_make(); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+        vkpool_t p = g_pool[i]; g_pool[i] = g_pool[--g_npool]; pool_ord_remove(i); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
         pthread_rwlock_unlock(&g_pool_mu);
         if (p.zero_copy) pool_copy_back(&p);
         free(p.baseline);
@@ -891,6 +912,7 @@ void vk_defer_free_image_sub(VkImage i, void *sub) { df_add(4, (void *)i, sub); 
 void img_sub_free_(void *s) { img_sub_free((imgsub *)s); }
 void vk_defer_free_image(VkImage i, VkDeviceMemory m) { df_add(1, (void *)i, (void *)m); }
 void vk_defer_free_view(VkImageView v) { df_add(2, (void *)v, NULL); }
+void vk_defer_free_bview(VkBufferView v) { df_add(3, (void *)v, NULL); }
 // Descriptor pools: the allocator counts what each set takes and moves to a new pool before any count runs out. Adreno's driver does not refuse an
 // allocation past a pool's sizes: it succeeds and the submission then fails as a whole at vkEndCommandBuffer (VK_ERROR_OUT_OF_HOST_MEMORY; NEO's
 // handheld frames with 32-slot texture arrays crossed the old 8192 combined-sampler limit at about the 712th draw)
