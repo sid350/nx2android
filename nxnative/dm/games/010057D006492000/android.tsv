@@ -8,3 +8,6 @@ status	boots
 tested	v327680 Red Magic Astra NP05J (Snapdragon 8 Elite, Adreno 830, Android 16)
 package	org.nx2a.t010057d006492000
 orientation	landscape
+# Without these two a docked run on the Adreno 830 held 24 fps with the GPU at about 40 ms a frame; with them 30 fps at about 8 ms (2026-11-06, which of the two does it not separated)
+env	DM_ADAPTIVE_FPS=0
+env	DM_VK_CB_DRAWS=32
