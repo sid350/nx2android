@@ -14,7 +14,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent.parent / 'gfx/tools'
 sys.path[:0] = [str(TOOLS), str(HERE)]
-import dmsh_facts, dmsh_chain, dmsv   # noqa: E402  (DM_GAME picks the profile)
+import dmsh_facts, dmsh_chain, dmsv, spv_patch   # noqa: E402  (DM_GAME picks the profile)
 from shader_split import glslc_stage   # the package reader also recognizes headerless compute code
 
 ap = argparse.ArgumentParser()
@@ -366,6 +366,7 @@ def main():
             if line and not line.startswith('#'):
                 key, source, target, sites = line.split()
                 handle_remaps[key] = int(source, 0), int(target, 0), int(sites)
+    stores = GAME.table('android_shader_stores.tsv'); store_fixes = spv_patch.read_table(stores) if stores.exists() else {}
     pc, loc = {}, {}
     for ln in open(MAP, encoding='utf-8'):
         c = ln.rstrip('\n').split('\t')
@@ -420,6 +421,7 @@ def main():
         binds, local, io = spirv_bindings(spv)
         if k in handle_remaps:
             spv = remap_handles(spv, *handle_remaps[k])
+        for fix in store_fixes.get(k, ()): spv = spv_patch.replace_store(spv, *fix)
         st = stages[k]
         cl = [classify(st, b, res) for b in binds]
         for e in cl: kinds_all[e['kind']] += 1
