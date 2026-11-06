@@ -5,6 +5,7 @@ Each game the port knows has a folder `dm/games/<id>/`, named after the base gam
 - **`game.tsv`**: the game's constants, one `key<TAB>value` row each, with comments on their own lines.
 - **The shader tables** that `shader_split.py` writes: `shader_map.tsv` (+ `.conflicts.tsv`), `shader_facts.tsv`, `shader_pairs.tsv`.
 - **`shader_facts_manual.tsv`** (optional): hand-written translation facts in `shader_facts.tsv`'s row format, for what the machine code cannot tell (Link's Awakening: a vertex input the integer-input guess gets wrong; Breath of the Wild and Tears of the Kingdom: integer fragment outputs, which a game without a PC version has no other source for). `shader_split.py` merges it over the generated rows; since the table is on the chain, changing it changes only that profile's chain version.
+- **`android_shader_stores.tsv`** (optional, Android): SPIR-V corrections for a shader the Vulkan backend draws differently from the Apple chain, one `OpStore`'s value swapped for a constant of the module (`dm/android/tools/spv_patch.py`). A row whose ids no longer match the translator's output stops the build. OCTOPATH TRAVELER: the Bokeh depth of field's low-contrast tiles.
 - **`pso_manifest.tsv`**: the prewarm seed list.
 - **`vk_capture.tsv`** (a Vulkan game that generates its shaders at run time, Super Mario Galaxy): the keys of the SPIR-V modules it generates.
 - **`gl_capture.tsv`** (an OpenGL game that puts its GLSL together at run time, Balatro): the files (`<key>.vert` / `<key>.frag`) of the shaders it compiles.

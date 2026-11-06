@@ -14,7 +14,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent.parent / 'gfx/tools'
 sys.path[:0] = [str(TOOLS), str(HERE)]
-import dmsh_facts, dmsh_chain, dmsv, shader_products, spv_half, spv_precise, spv_texture_offsets   # noqa: E402  (DM_GAME picks the profile)
+import dmsh_facts, dmsh_chain, dmsv, shader_products, spv_half, spv_precise, spv_texture_offsets, spv_patch   # noqa: E402  (DM_GAME picks the profile)
 from forkpool import fork_map   # noqa: E402  (the pool without /dev/shm's semaphores, as on Android)
 from shader_split import glslc_stage   # the package reader also recognizes headerless compute code
 
@@ -399,7 +399,7 @@ def _final_one(item):
     translator's own <w>/<key>.spv (not through the pool's pipe: the shaders are gigabytes together); the entry's small
     parts come back. A shader that fails comes back with its reason, not as an exception: the parent lists it, as the
     serial loop did"""
-    k, st, c1, key16, remap, local_hint, fail, berr = item
+    k, st, c1, key16, remap, local_hint, fail, berr, stores = item
     try:
         if fail: raise ValueError(fail)
         product = shader_products.output(_FINAL_W, k, STAGES[st])
@@ -409,6 +409,7 @@ def _final_one(item):
         binds, local, io = spirv_bindings(spv)
         shader_products.validate_bindings(binds, res)
         if remap: spv = remap_handles(spv, *remap)
+        for fix in stores: spv = spv_patch.replace_store(spv, *fix)   # the profile's android_shader_stores.tsv (OCTOPATH TRAVELER's depth of field)
         cl = [classify(st, b, res) for b in binds]
         # header words 2-4: a compute shader's local size; a vertex shader's input locations (all, signed int, unsigned int); a pixel shader's output locations
         hdr3 = (local or local_hint or [1, 1, 1]) if st == 'cs' else io[1] if st == 'vs' else io[3] if st == 'ps' else [0, 0, 0]
@@ -438,6 +439,7 @@ def main():
             if line and not line.startswith('#'):
                 key, source, target, sites = line.split()
                 handle_remaps[key] = int(source, 0), int(target, 0), int(sites)
+    stores = GAME.table('android_shader_stores.tsv'); store_fixes = spv_patch.read_table(stores) if stores.exists() else {}
     pc, loc = {}, {}
     for ln in Path(MAP).read_text(encoding='utf-8').splitlines():
         c = ln.rstrip('\n').split('\t')
@@ -555,7 +557,7 @@ def main():
     # <w>/<key>.bundle.spv beside the translator's own <w>/<key>.spv (not through the pool's pipe: the shaders are
     # gigabytes together), and the entry's small parts come back.
     items = [(k, stages[k], c1s[k], gs_var[k] if k in gs_var else int(k, 16), handle_remaps.get(k), jobs[k].get('local'),
-              failures.get(k), batch_errors.get(k)) for k in keys]
+              failures.get(k), batch_errors.get(k), tuple(store_fixes.get(k, ()))) for k in keys]
     for key16, got, err in final_map(items, min(a.jobs, len(items)), w):
         if err is not None:
             failed.append([f'{key16:016x}', err])
