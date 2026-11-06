@@ -1,0 +1,7 @@
+# Unreal's Bokeh depth of field missing in the field (S'warkii): sprite vertex shader f4cadf41d03d6cf8 (global shader cache) collapses low-contrast tiles to size 0 on Android, so flat
+# areas add nothing to the blur layers and the recombine keeps the sharp frame. The depth, the circle of confusion and the layers were checked correct; the iPhone blurs there from the same
+# translated SPIR-V. %183 is the tile's "draw four sprites" flag; true for every tile matched the iPhone's sharpness in each zone measured (dm/games/README.md).
+# Why only Android collapses the tile is not established. Not one driver's compiler: Qualcomm's (512.800.72) and Turnip Gen8 V38 (Mesa 27.0.0) draw it alike. NaN-aware min/max (732294b) and
+# the Vulkan pass and descriptor reuse switches do not change it, and the shaders use no RelaxedPrecision.
+# shader key, pointer, old value, new value (spv_patch.py)
+f4cadf41d03d6cf8	183	681	650

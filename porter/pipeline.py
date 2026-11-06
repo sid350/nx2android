@@ -632,7 +632,7 @@ class Port:
         PROG.stage('Vulkan shaders', step='building the translator')
         xlate, xkey = self.translator()
         PROG.set(step='checking the inputs')
-        key = nsp.fingerprint(nsp.package_key(pkg), ('files', [DM / 'android/tools/shader_vk.py', DM / 'android/tools/dmsv.py'] + nsp.tool_files(NXNATIVE)), ('files', nsp.profile_files(self.g)), xkey,
+        key = nsp.fingerprint(nsp.package_key(pkg), ('files', [DM / 'android/tools/shader_vk.py', DM / 'android/tools/dmsv.py', DM / 'android/tools/spv_patch.py'] + nsp.tool_files(NXNATIVE)), ('files', nsp.profile_files(self.g)), xkey,
                               ('files', sorted(cap.glob('*.bin'))))
         if self.dmsv.is_file() and (note := nsp.reused(kf, key)) is not None:
             PROG.end(f'{note}, reused (inputs unchanged)'); return
