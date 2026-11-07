@@ -45,6 +45,8 @@ The source of each switch is in `nxnative/dm/android/` unless noted. Check the c
 | `DM_VK_CRUMBS=1` | start-up (`gfx_vk_exec.c`) | for a device lost (GPU hang): each pass end and dispatch writes its number into host-visible memory after a full barrier; when the device is lost the log names the last work the GPU finished and the passes after it, with their shaders. Slows the GPU |
 | `[timeline]` lines | with `DM_NVN_ASYNC=1` (`gfx/nvn/hle_nvn.c`) | per frame: the game's gap between a sync wait and its next submission, queue delay, replay, and the GPU's tail after the replay |
 | `DM_NVN_SEQ=N` | live (`gfx/nvn/hle_nvn.c`) | the next N frames' submissions, fences, acquires, sync waits (with the time waited) and presents, in order, with thread and time: what the render thread waits for |
+| `DM_LAN_TRACE=1` | start-up (`host/hle_socket.c`, `host/hle_ldn.c`) | with `DM_LAN=1`: every `nn::socket` call (addresses, flags, result, errno) and every `nn::ldn` / `nn::nifm` query with its result, as `[lan]` lines |
+| `DM_HLECOUNT=<file>` | start-up (`host/hle_count.c`) | count every HLE call and write a TSV (category, name, count) at exit; the `ctl.txt` line `hlecount <file>` writes the counts so far, so two dumps around one action show the calls it made |
 
 ## Behaviour toggles (for A/B; defaults are the fixes)
 
@@ -54,7 +56,7 @@ The source of each switch is in `nxnative/dm/android/` unless noted. Check the c
 | `DM_VK_SUBMIT_SPLIT=0` | live | don't submit the pieces early |
 | `DM_VK_X_CUTANY=1` | live | cut before any pass (the old rule that caused LRZ flicker) |
 | `DM_VK_X_NOGS=1` | live | leave out draws with a geometry shader (A/B their GPU cost: Xenoblade Chronicles 3's effects, 0.7 ms of 22 in a battle) |
-| `DM_VK_LRZ_TOUCH=0` | live | drop the LRZ touches: the one-texel depth read before passes that load a depth-stencil buffer (brings NEO's menu-wipe flicker back) the texel written back into the depth buffer a pass switches away from (brings XC3's cloud-layer drop-outs back), and the texel written back into a depth buffer a pass goes on with after a command-buffer cut (brings Hades II's one-frame light drop-outs back) |
+| `DM_VK_LRZ_TOUCH=0` / bits | live | drop the LRZ touches: the one-texel depth read before passes that load a depth-stencil buffer (brings NEO's menu-wipe flicker back) the texel written back into the depth buffer a pass switches away from (brings XC3's cloud-layer drop-outs back), and the texel written back into a depth buffer a pass goes on with after a command-buffer cut (brings Hades II's one-frame light drop-outs back) | Bits instead of 0/1: 2 the read before load passes, 4 the write-back on a depth switch, 8 the write-back at a cut, 16 only a read at a cut (with 8 off), 32 the last texel instead of the first (1 = 14, all three). Animal Crossing's band glitch came from bit 8 alone (gfx_vk_exec.c, the cut)
 | `DM_VK_FDZ=0` | live | no fragment-depth variants: draws that test a depth buffer a fragment shader wrote through `gl_FragDepth` (in the last two presents) normally get a variant of their fragment shader that writes `gl_FragDepth = gl_FragCoord.z`, the same depth tested after the shader, out of Adreno's early culling, which dropped whole triangles of Hades II's lights (they went out in turn every 24-48 frames) |
 | `DM_VK_FLIPY=0` | live | the old clip-space y convention (pictures flip) |
 | `DM_VK_X_NOBAR`, `X_DEPTH`, `X_COLOR` | live | cost measurements that **draw wrong**: no barrier before a pass; depth neither loaded nor stored; colour not loaded unless cleared |
@@ -106,6 +108,8 @@ The source of each switch is in `nxnative/dm/android/` unless noted. Check the c
 | `DM_MOTION=0` | start-up (`android/front_android.c`) | the device's gyroscope no longer moves player 1's six-axis sensor (`dm_motion_set`, `host/hle_hid.c`; aiming by motion, as Tears of the Kingdom's bow): the sensor stays at rest, as before. On by default when the device has a gyroscope; the log says `front end: the device's gyroscope (…) moves the controller's six-axis sensor` |
 | `DM_MOTION_LOG=1` | start-up (`android/front_android.c`) | logs the mapped motion once a second (`front end: motion (rotation …) acc … G, gyro … rev/s`): lying flat face up reads acc ≈ (0, 0, −1); lying flat, raising the top edge reads gyro x positive and turning left gyro z positive. Each change of the display's rotation logs `front end: display rotation … degrees` |
 | `DM_TOUCH_DOCKED=screen` | first touch read (`host/hle_touch.c`) | profile env: docked touch points as a game that takes the panel's values as screen pixels expects them (Unity 2019.4: x = screen column, y = screen row − 360 on 1920x1080). `=pixels`: the 1920x1080 screen pixel as it is, top-down (Football Manager 26 Touch). On Android touches reach the game in both modes (`hle_hid.c` `touch_on`); a Switch has no docked touch |
+| `DM_LAN=1` | start-up (`host/hle_ldn.c`) | profile env: local play over the Wi-Fi network (`nn::ldn` as Atmosphère's ldn_mitm, UDP and TCP 11452; `nn::socket` on real sockets; nifm's local mode, parental controls' free communication and play history keys granted). Off, all of it stays offline |
+| `DM_TIME_OFFSET=<seconds>` | start-up (`host/hle_time.c`) | the user clocks run that many seconds from the device's time (a test jumps to the next day or hour without changing the device's clock); the steady clock is unchanged |
 
 ## Control file lines (`ctl.txt`)
 - **Buttons:** `A`, `B`, `X`, `Y`, `L`, `R`, `ZL`, `ZR`, `Plus`, `Minus`, `Up`, `Down`, `Left`, `Right`, `LS`, `RS`.
@@ -113,6 +117,6 @@ The source of each switch is in `nxnative/dm/android/` unless noted. Check the c
 - **Hold and combine:** `~seconds` sets the hold (default 0.15), e.g. `A~0.2`. `+` combines keys.
 - **Touch:** `T<x>x<y>` taps a normalized point.
 - **Motion:** `Shake` shakes player 1's controller (its six-axis sensor) for the hold, at least one whole shake.
-- **Other lines:** `env KEY=VALUE`, `shot <path>`, `passdump <n>`, `drag x0 y0 x1 y1 [s]`. A line starting with `#` is ignored.
+- **Other lines:** `env KEY=VALUE`, `shot <path>`, `passdump <n>`, `drag x0 y0 x1 y1 [s]`, `hlecount <file>` (with `DM_HLECOUNT`). A line starting with `#` is ignored.
 - **Delays:** an unknown key name logs `[RED]` but still waits its hold, so `none~0.1` works as a delay between lines.
 - **Replay:** the reader starts at the file's end when the app launches; lines from earlier runs are never replayed.
