@@ -593,6 +593,7 @@ def pkz_shaders(path, rel, ents, out):
 # CPK and binding-table readers adapted from seedds/nxnative's shader_split.py.
 # The local NieR 1.0.3 DAT census matches its 1,371 objects / 1,225 distinct keys.
 CPK = b'CPK '
+HNSH = b'HNSHV002'   # GFD's NVN shader blocks (hnsh_shaders)
 def cpk_jobs(files, parts=64):
     """Every entry of every CRI CPK archive in ranges of about equal length (Bayonetta 2: six in the RomFS root, 9.5 GB, 6,091 files, 12 GB of them CRILAYLA-compressed; its shaders are BNSH
     files in shader.dat, shader2.dat and shadereff.dat, but no file name is relied on). → ([(path, rel, entries), …], the CPK paths)"""
@@ -1033,7 +1034,24 @@ def adrp_targets(d, lo, hi):
                 break
     return out
 
-def raw_shaders(d, label, known=()):
+def hnsh_shaders(d, label):
+    """GFD's NVN shader blocks (Atlus, Persona 5 Royal: the SVSV entries of its GSC0 shader caches, 108 in main): 'HNSHV002', big-endian u32 length, +0x10 option count, +0x18 variant count,
+    then (no options, one variant) from +0x24 a little-endian descriptor whose +0x30 control section offset, +0x34 code area offset, +0x38 code area length, +0x3c control length are relative
+    to +0x24. The code area follows the control section with no alignment (the control sections are 0x850 bytes); compute code has no header. A block with options (main's one with 10 and
+    121 variants) is left to raw_shaders, which takes its control sections by the same adjacency"""
+    out = []
+    for m in re.finditer(re.escape(HNSH), d):
+        b = m.start() + 0x24
+        if b + 0x40 > len(d) or struct.unpack_from('>II', d, m.start() + 0x10) != (0, 0) or struct.unpack_from('>I', d, m.start() + 0x18)[0] != 1: continue
+        pctl, pcode, ncode, nctl = struct.unpack_from('<IIII', d, b + 0x30)
+        ctl, code = d[b + pctl:b + pctl + nctl], d[b + pcode:b + pcode + ncode]
+        st = glslc_stage(ctl, code) if ctl[:4] == CTL_MAGIC else None
+        why = 'no stage' if not st else check(label, st, ctl, code)
+        if why: red(f'{label} HNSH @{m.start():#x}: {why}')
+        out.append((f'{label}#HNSH@{m.start():#x}', st, ctl, code))
+    return out
+
+def raw_shaders(d, label, known=(), hnsh=False):
     """Control sections in main that are in no GLSLC output and no BNSH file: a shader compiled offline whose control section and code area the code hands to nvnShaderData itself (Advance Wars 1+2:
     Re-Boot Camp, Unity 2020.2 with Bink 2: the movie player's 32: 2 vertex, 22 pixel and 8 compute shaders; without them its movies drew white). Most are 0x20-byte records in data {code area
     pointer, control section pointer, u32 code length, u32 control length} (two tables, main+0x49eae50 and +0x49fb5c0), found as two relocated slots, the second pointing at the control section and
@@ -1063,6 +1081,11 @@ def raw_shaders(d, label, known=()):
         for k in ([code_of[c]] if c in code_of else sorted((k for k in ((c + nctl + 15) & ~15, c - n) if k in built and c in built and near(k) < 0x400), key=near)):
             code = d[k:k + n]; st = glslc_stage(ctl, code) if k >= 0 and CTL_MAGIC not in code else None
             if st and not check(label, st, ctl, code): out.append((f'{label}#RAW@{c:#x}', st, ctl, code)); why = None; break
+        # GFD (Persona 5 Royal's main, 121 outside its single-variant HNSH blocks): the code area right after the control section's own length, mostly unaligned (0x850-byte control sections),
+        # with no data record and no address the code builds; taken only when no rule above found one, and only in a main that holds HNSHV002 (hnsh), so the other games' tables stay as they were
+        if why and hnsh:
+            code = d[c + nctl:c + nctl + n]; st = glslc_stage(ctl, code) if CTL_MAGIC not in code else None
+            if st and not check(label, st, ctl, code): out.append((f'{label}#RAW@{c:#x}', st, ctl, code)); why = None
         if why: print(f'[RED] {label} control section @{c:#x}: {why}; left out', flush=True)
     return out
 
@@ -1606,6 +1629,7 @@ def scan_blob(d, label, out):
         if m.start() + size <= len(d) and d[m.start() + 0x60:m.start() + 0x64] == b'grsc': out.extend(bnsh_shaders(d, m.start(), label))
     if MGFX in d: out.extend(mgfx_shaders(d, label))
     if b'SLCT' in d: out.extend(slct_loose(d, label))   # Monolith SLCTs outside an HCPS (Xenoblade Chronicles 3's main)
+    if HNSH in d: out.extend(hnsh_shaders(d, label))   # GFD (Persona 5 Royal's main and the shader caches in its CPK)
 
 def group(label):
     """source group (second half of the package file name)"""
@@ -2023,7 +2047,7 @@ def scan_file(args):
         import unityfs
         try: unity_shaders(d, '/' + rel, found, trees if not TREES else dict(TREES))
         except unityfs.NoTree: return rel, {}, set(), 'defer'
-    elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] != b'MSHD' and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d: return rel, {}, set(), {}   # a SARC may hold Yaz0 members
+    elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] != b'MSHD' and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d and HNSH not in d: return rel, {}, set(), {}   # a SARC may hold Yaz0 members
     else:
         scan_blob(d, '/' + rel, found)
         # whole GLSLC outputs in a file no other reader takes (FINAL FANTASY TACTICS - The Ivalice Chronicles: its engine's technique files, resources_nx/…/shader/*.tec, 261 outputs beside
@@ -2081,7 +2105,7 @@ def main():
         found = []; scan_blob(img, main_label, found)
         found += glslc_shaders(img, main_label, need=False)
         found += embedded_nx_shaders(img, main_label)
-        found += raw_shaders(img, main_label, {c for _, _, c, _ in found})
+        found += raw_shaders(img, main_label, {c for _, _, c, _ in found}, hnsh=HNSH in img)
         # GLSLC outputs the game compiles at run time, captured on the Mac (hle_glslc.c): <version dir>/glslc_capture, or DM_GLSLC_CAPTURE. A game needs them when main holds GLSL sources and
         # calls glslcCompile in a module it loads (Fire Emblem: Three Houses; profile_guess.py shader_sources). Captain Toad: Treasure Tracker imports it with agl's GLSL sources, but no module defines it
         cap = os.environ.get('DM_GLSLC_CAPTURE') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'glslc_capture')
