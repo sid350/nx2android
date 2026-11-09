@@ -176,6 +176,19 @@ NVN(nvnDeviceGetInteger, void, const NVNdevice *d, NVNdeviceInfo what, int *out)
     if (w == 0x67) { *out = 256; return; }
     if (w >= sizeof g_devinfo / sizeof *g_devinfo) { LOG("[RED] nvnDeviceGetInteger unknown item %#x, returning 0", w); *out = 0; return; }
     *out = g_devinfo[w];
+    // DM_NVN_DEVINFO=<item>=<value>[,…] (hex or decimal) overrides table items for one game (env.txt, from the profile's android.tsv): Persona 5 Royal (SDK 13.3.2) sizes a 16x16 RGBA8 linear
+    // render target with item 0x39 and asserts it fits the 0x400 bytes its texture descriptor reserved (RsdxDevice11.cpp line 3262): 128 gives 0x800, so its driver reports 64 or less there
+    static int ovr_n = -1; static unsigned ovr[16][2];
+    if (ovr_n < 0) {
+        ovr_n = 0; const char *e = getenv("DM_NVN_DEVINFO");
+        for (char *p = (char *)e; p && *p && ovr_n < 16; ) {
+            char *q; unsigned long k = strtoul(p, &q, 0), v;
+            if (*q != '=') break;
+            v = strtoul(q + 1, &p, 0); ovr[ovr_n][0] = (unsigned)k; ovr[ovr_n++][1] = (unsigned)v; LOG("[nvn] DM_NVN_DEVINFO: item %#lx = %lu", k, v);
+            if (*p == ',') p++;
+        }
+    }
+    for (int i = 0; i < ovr_n; i++) if (ovr[i][0] == w) *out = (int)ovr[i][1];
     // 0x2E / 0x30 describe the GPU code the host can translate, not the linked SDK's driver. Precompiled shaders can come from a newer compiler: ASTRAL CHAIN links SDK 6.4 but its
     // hwfillcolor.vso is 1.15; main+0x9e97d0 rejects the old SDK-based answer 1.14 and initialization unwinds into a null read at main+0x9c0d1c. Our chain translates through 1.16
     // (Bayonetta 3, shader-object check at main+0xd0da20), so advertise that range for every SDK. Retain the floor from a game's own run-time GLSLC (Catherine: Full Body,
