@@ -84,7 +84,7 @@ uint64_t vk_replay_ns(void) { return g_vkst.ns_exec; }   // the replay time so f
 // uniform updates land at each cut, DM_VK_X_NOKEEP no pass kept for the same targets, DM_VK_X_NOSHC no shadow reuse
 static int g_fdz = 1;  // DM_VK_FDZ (live): fragment-depth variants for draws on depth written by fragment shaders (pipeline key fdz)
 enum { LRZ_READ = 2, LRZ_SWITCH = 4, LRZ_CUT = 8, LRZ_ALL = 14, LRZ_CUT_RD = 16, LRZ_CORNER = 32 };   /* LRZ_CUT_RD: only read at a cut; LRZ_CORNER: the last texel, not the first (tests) */   // DM_VK_LRZ_TOUCH bits: the read before a load pass, the write-back on a depth switch, the write-back at a cut
-static int g_x_nosetc, g_x_nodrvc, g_x_landcut, g_x_nokeep, g_x_nobc, g_x_cutany, g_lrz_touch, g_xfb_on = 1, g_x_nogs, g_spv_alt, g_x_nodispbar; int g_x_noshc; static int g_x_ctexfull;   // g_xfb_on: DM_VK_XFB=0 captures no transform feedback (A/B)
+static int g_x_nosetc, g_x_nodrvc, g_x_landcut, g_x_nokeep, g_x_nobc, g_x_cutany, g_lrz_touch, g_xfb_on = 1, g_x_nogs, g_spv_alt, g_x_nodispbar; int g_x_noshc;   // g_xfb_on: DM_VK_XFB=0 captures no transform feedback (A/B)
 static int g_x_nosetmemo, g_x_setverify;   // DM_VK_X_NOSETMEMO=1 (live, A/B): no per-stage set memo; DM_VK_X_SETVERIFY=1 (live): one memo hit in 64 checked (see stage_set)
 static int g_vbound = 1;   // DM_VK_VBOUND (see vbuf_bound)
 // DM_VK_PROF_SLOW=1 (live): a submission whose replay took over 40 ms logs where it went: pipelines built on the replay thread, textures (vk_tex: images made and
@@ -169,7 +169,7 @@ static void x_read(void) { const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws
     { const char *tz = getenv("DM_VK_TRACE_SIZE"); snprintf(g_x_tracesize, sizeof g_x_tracesize, "%s", tz ? tz : ""); } const char *e; g_x_nobar = (e = getenv("DM_VK_X_NOBAR")) && atoi(e); g_x_depth = (e = getenv("DM_VK_X_DEPTH")) && atoi(e); g_x_color = (e = getenv("DM_VK_X_COLOR")) && atoi(e);
     g_x_nosetc = (e = getenv("DM_VK_X_NOSETC")) && atoi(e); g_x_nodrvc = (e = getenv("DM_VK_X_NODRVC")) && atoi(e); g_x_landcut = (e = getenv("DM_VK_X_LANDCUT")) && atoi(e);
     g_x_nodispbar = (e = getenv("DM_VK_X_NODISPBAR")) && atoi(e);
-    g_x_ctexfull = (e = getenv("DM_VK_CTEX_FULL")) && atoi(e); g_x_nokeep = (e = getenv("DM_VK_X_NOKEEP")) && atoi(e); g_x_nobc = (e = getenv("DM_VK_X_NOBC")) && atoi(e); g_x_noshc = (e = getenv("DM_VK_X_NOSHC")) && atoi(e); g_x_cutany = (e = getenv("DM_VK_X_CUTANY")) && atoi(e); g_x_nogs = (e = getenv("DM_VK_X_NOGS")) && atoi(e); g_spv_alt = (e = getenv("DM_VK_SPV_ALT")) && atoi(e); g_rd_touch = !((e = getenv("DM_VK_RD_TOUCH")) && !atoi(e));
+    g_x_nokeep = (e = getenv("DM_VK_X_NOKEEP")) && atoi(e); g_x_nobc = (e = getenv("DM_VK_X_NOBC")) && atoi(e); g_x_noshc = (e = getenv("DM_VK_X_NOSHC")) && atoi(e); g_x_cutany = (e = getenv("DM_VK_X_CUTANY")) && atoi(e); g_x_nogs = (e = getenv("DM_VK_X_NOGS")) && atoi(e); g_spv_alt = (e = getenv("DM_VK_SPV_ALT")) && atoi(e); g_rd_touch = !((e = getenv("DM_VK_RD_TOUCH")) && !atoi(e));
     g_lrz_touch = (e = getenv("DM_VK_LRZ_TOUCH")) ? atoi(e) : 1; if (g_lrz_touch == 1) g_lrz_touch = LRZ_ALL;   /* 0 none, 1 all, else LRZ_* bits */ g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
     g_psplit = (e = getenv("DM_VK_PASS_SPLIT")) ? atoi(e) : 0; g_setsplit = (e = getenv("DM_VK_SETSPLIT")) && atoi(e); g_psplit_depth = (e = getenv("DM_VK_PASS_SPLIT_DEPTH")) && atoi(e);
     g_x_rdkeep = (e = getenv("DM_VK_X_RDKEEP")) && atoi(e); g_vbound = !((e = getenv("DM_VK_VBOUND")) && !atoi(e)); g_x_logfs = (e = getenv("DM_VK_LOG_FS")) ? strtoull(e, NULL, 16) : 0; g_x_nflat = 0; if ((e = getenv("DM_VK_X_FLAT_VS"))) for (char *q = (char *)e; *q && g_x_nflat < 8; ) { char *nx; uint64_t v = strtoull(q, &nx, 16); if (nx == q) break; int m = 7; if (*nx == ':') m = (int)strtol(nx + 1, &nx, 10); g_x_flat_mode[g_x_nflat] = m; g_x_flat[g_x_nflat++] = v; q = *nx ? nx + 1 : nx; } g_samp_snap = !((e = getenv("DM_NVN_SAMP_SNAP")) && !atoi(e)); g_lin_back = !((e = getenv("DM_VK_LIN_BACK")) && !atoi(e)); g_async_pipe = !((e = getenv("DM_VK_ASYNC_PIPE")) && !atoi(e)); g_prof_on = (e = getenv("DM_VK_PROF_SLOW")) && atoi(e); { extern volatile int g_vk_samp_log; if ((e = getenv("DM_VK_SAMP_LOG")) && atoi(e) > 0) { g_vk_samp_log = atoi(e); setenv("DM_VK_SAMP_LOG", "0", 1); } } g_x_nosetmemo = (e = getenv("DM_VK_X_NOSETMEMO")) && atoi(e); g_x_setverify = (e = getenv("DM_VK_X_SETVERIFY")) && atoi(e);
@@ -2313,43 +2313,9 @@ static void copy_t2t(const p_copy_t2t *c) {
     }
     vk_img_barrier_all(cb);
 }
-// A texture clear of some channels or of a region only (NVN's ClearTexture mask and region): vkCmdClearColorImage writes every channel of the whole subresource, so the
-// texture is bound as the only render target of a pass of its own and cleared there like ClearColor (clear_masked for a channel mask, vkCmdClearAttachments for a region).
-// Persona 5 Royal clears alpha alone (mask 0x8) of its 1920x1080 RGBA8 scene texture in the casino: cleared in full, the scene went black. The bound targets are put back after.
-static void set_rt(const p_set_rt *r);
-static int clear_tex_in_pass(const p_clear_tex *c, const vkimg_t *im, int mask) {   // 1 = done
-    if (!(im->aspect & VK_IMAGE_ASPECT_COLOR_BIT) || c->is_uint || im->d != 1 || (im->layers > 1 && !c->has_view)) return 0;
-    const vkfmt_t *f = vk_fmt(c->tex->d.format); if (!f || f->is_int) return 0;
-    tex_t col[8], dep; view_t cv[8], dv; uint8_t hc[8], hcv[8], hd = S.rt_has_dep, hdv = S.rt_has_dview; int n = S.rt_n; uint32_t bad[8];
-    memcpy(col, S.rt_col, sizeof col); dep = S.rt_dep; memcpy(cv, S.rt_cview, sizeof cv); dv = S.rt_dview; memcpy(hc, S.rt_has_col, sizeof hc); memcpy(hcv, S.rt_has_cview, sizeof hcv); memcpy(bad, S.rt_bad, sizeof bad);
-    p_set_rt r; memset(&r, 0, sizeof r); r.n = 1; r.color[0] = c->tex; r.has_cview[0] = c->has_view; if (c->has_view) r.cview[0] = c->view;
-    int sc_set = S.sc_set; p_scissor sc = S.sc; S.sc_set = 0;
-    vk_end_pass(); set_rt(&r);
-    int done = 0;
-    if (begin_pass() && S.ncol >= 1 && S.cfmt[0] != VK_FORMAT_UNDEFINED) {
-        int32_t x = c->r.xoffset, y = c->r.yoffset; int64_t x1 = (int64_t)x + c->r.width, y1 = (int64_t)y + c->r.height;
-        if (x < 0) x = 0; if (y < 0) y = 0; if (x1 > S.pass_w) x1 = S.pass_w; if (y1 > S.pass_h) y1 = S.pass_h;
-        VkRect2D rect = {{x, y}, {(uint32_t)(x1 > x ? x1 - x : 0), (uint32_t)(y1 > y ? y1 - y : 0)}};
-        if (!rect.extent.width || !rect.extent.height) done = 1;
-        else if ((mask & 0xf) != 0xf) { p_clear_color cc = {0, mask}; memcpy(cc.rgba, c->c.f, 16); done = clear_masked(&cc, rect); }
-        else if (pass_commit()) { VkClearAttachment a = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {{{c->c.f[0], c->c.f[1], c->c.f[2], c->c.f[3]}}}}; VkClearRect cr = {rect, 0, 1};
-            vkCmdClearAttachments(vk_cmd(), 1, &a, 1, &cr); done = 1; }
-    }
-    vk_end_pass();
-    memcpy(S.rt_col, col, sizeof col); S.rt_dep = dep; memcpy(S.rt_cview, cv, sizeof cv); S.rt_dview = dv; memcpy(S.rt_has_col, hc, sizeof hc); memcpy(S.rt_has_cview, hcv, sizeof hcv);
-    memcpy(S.rt_bad, bad, sizeof bad); S.rt_has_dep = hd; S.rt_has_dview = hdv; S.rt_n = n; S.sc_set = sc_set; S.sc = sc;
-    g_bc_stale = 1;
-    return done;
-}
 static void clear_tex(const p_clear_tex *c) {
     vk_end_pass();
     vkimg_t *im = vk_tex(c->tex); if (!im) return;
-    if (!g_x_ctexfull) {   // DM_VK_CTEX_FULL=1: every texture clear writes the whole level, every channel (the behaviour before clear_tex_in_pass)
-        int mask = c->mask & 0xf ? c->mask & 0xf : 0xf;
-        VkImageSubresourceLayers l0 = sub_of(im, &c->view, c->has_view, c->r.zoffset);
-        int part = c->r.xoffset || c->r.yoffset || (uint32_t)c->r.width < (im->w >> l0.mipLevel) || (uint32_t)c->r.height < (im->h >> l0.mipLevel);
-        if ((part || mask != 0xf) && clear_tex_in_pass(c, im, mask)) return;
-    }
     VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_img_barrier_all(cb); im->gpu_w = 1;
     VkImageSubresourceLayers l = sub_of(im, &c->view, c->has_view, c->r.zoffset);
     VkImageSubresourceRange rg = {l.aspectMask, l.mipLevel, 1, l.baseArrayLayer, im->layers > 1 ? (uint32_t)(c->r.depth ? c->r.depth : 1) : 1};
