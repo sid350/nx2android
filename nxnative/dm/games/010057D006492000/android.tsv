@@ -8,3 +8,6 @@ status	boots
 tested	v327680 Red Magic Astra NP05J (Snapdragon 8 Elite, Adreno 830, Android 16)
 package	org.nx2a.t010057d006492000
 orientation	landscape
+# The SVC spin (7f94bcc, #169) froze it: 33 s on loading a save (Android's not-responding dialog) and a hang in the first village, with the game thread yielding in a loop; with
+# the spin off the save loads in 0.5 s and play holds 30 fps (2026-11-09, NP05J)
+env	DM_SVC_SPIN=0
