@@ -3,11 +3,11 @@
 # the rewrite for DM_TARGET=android, the Vulkan shader bundle, the host built with the player's NDK, the APK, the data pack and the install.
 # Work files go where upstream's NSP script puts them, <game folder>/<title ID>_build/ (extract/, aoc/, shader/, logs/ are shared with an iOS build of the same folder),
 # with the Android ones in its android/ folder.
-import importlib.util, os, re, shutil, sys
+import importlib.util, os, re, shutil, struct, sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from porter import config, datapack, dumps, fpslocker, install, paths, profiles, toolchain
+from porter import config, datapack, dumps, fpslocker, install, ips, paths, profiles, toolchain
 from porter.adb import NO_ADB, Adb, AdbError
 from porter.paths import DM, NXNATIVE
 from porter.upstream import BuildError, PROG, android_profile, game, nacp, nsp, profile_guess, say, trinity, uepak
@@ -34,6 +34,7 @@ class Options:
     debug: bool = False                # a development build: debug information, debuggable, DM_CTL
     experimental: bool = False         # a game not ported to Android yet: a provisional profile from upstream's survey (or a copy of its iOS profile), status experimental
     package: str = ''                  # the app's package instead of the profile's (a test install beside another build of the game)
+    ips: list = field(default_factory=list)   # Atmosphere ExeFS patches (.ips) of main, applied before the rewrite (porter/ips.py): a mod's code bytes, kept out of the APK
     fps60: bool = False                # 60 fps: the profile's own frame-rate cap, else the build's FPSLocker-Warehouse config (porter/fpslocker.py)
     vulkan_driver: Path = None         # an arm64 Vulkan driver (Mesa's Turnip) packed in the APK and used instead of the system's (DM_VK_DRIVER, dm/android/gfx_vk_core.c)
     shared_font: Path = None           # a TrueType font packed as the system's shared fonts, instead of the device's Roboto (DM_SHARED_FONT, dm/host/hle_sdk16.c)
@@ -208,6 +209,7 @@ class Port:
         finally: self.drop_unpacked()   # a failed run leaves no decompressed dumps behind either
         self.check_graphics()
         self.fps_unlock()
+        self.exefs_patches()
         self.rewrite()
         if o.install: self.pull_captures()
         self.shaders()
@@ -621,6 +623,19 @@ class Port:
         n = tsv.count('\n') - 3
         say(f'60 fps: FPSLocker-Warehouse config {src}, by masagrator and contributors: {n} memory write(s)' + (f', {len(cuts)} code cut(s)' if cuts else ''))
         PROG.end(f'{n} memory write(s)' + (f', {len(cuts)} code cut(s)' if cuts else ''))
+
+    # ---- ExeFS patches (--ips): a mod's code bytes as the rewriter's cuts of main (patch_nso.py DM_PATCHES_EXTRA, beside an FPSLocker config's) ----
+    def exefs_patches(self):
+        if not self.o.ips: return
+        img, bid = fpslocker.nso_image(self.game / 'ExeFS/main')
+        rows = []
+        for p in self.o.ips:
+            try: rows += ips.cuts(p, img, bid)
+            except (ips.Refused, OSError, struct.error) as e: raise BuildError(f'ExeFS patch {p}: {e}')
+        d = self.aw / 'exefs_patches'; d.mkdir(exist_ok=True)
+        (d / 'patches.py').write_text(ips.patches_py(bid, rows, [Path(p).name for p in self.o.ips]), encoding='utf-8', newline='\n')
+        self.env['DM_PATCHES_EXTRA'] = os.pathsep.join([x for x in [self.env.get('DM_PATCHES_EXTRA')] if x] + [str(d / 'patches.py')])
+        say(f'ExeFS patches: {len(rows)} code record(s) from {len(self.o.ips)} file(s), applied to main build {bid[:16].upper()} before the rewrite')
 
     # ---- rewrite: patch_nso.py for the Android host's thread slots ----
     def rewrite(self):
