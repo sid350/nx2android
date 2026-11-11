@@ -1040,9 +1040,9 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         { extern uint64_t g_order_kept, g_order_ended; static uint64_t pk, pn;   // gfx_vk_exec.c g_order_keep
           if (g_order_kept + g_order_ended > pk + pn) VKLOG("order-only barriers per frame (last 600): %.1f kept inside their pass, %.1f ended it", (g_order_kept - pk) / 600.0, (g_order_ended - pn) / 600.0);
           pk = g_order_kept; pn = g_order_ended; }
-        { extern uint64_t g_ubd_shc_kept, g_ubd_shadows, g_ubd_big; static uint64_t pkk, psh, pbg;   // gfx_vk_core.c vk_ubd_shadow (DM_VK_UBD_SHC)
-          if (g_ubd_shadows > psh) VKLOG("uniform shadows per frame (last 600): %.1f made (%.1f of 32 KB or more), %.1f kept across other ranges' updates", (g_ubd_shadows - psh) / 600.0, (g_ubd_big - pbg) / 600.0, (g_ubd_shc_kept - pkk) / 600.0);
-          pkk = g_ubd_shc_kept; psh = g_ubd_shadows; pbg = g_ubd_big; }
+        { extern uint64_t g_ubd_shc_kept, g_ubd_shadows, g_ubd_big, g_ubd_ns; static uint64_t pkk, psh, pbg, pns;   // gfx_vk_core.c vk_ubd_shadow (DM_VK_UBD_SHC)
+          if (g_ubd_shadows > psh) VKLOG("uniform shadows per frame (last 600): %.1f made (%.1f of 32 KB or more) in %.2f ms, %.1f kept across other ranges' updates", (g_ubd_shadows - psh) / 600.0, (g_ubd_big - pbg) / 600.0, (g_ubd_ns - pns) / 6e8, (g_ubd_shc_kept - pkk) / 600.0);
+          pkk = g_ubd_shc_kept; psh = g_ubd_shadows; pbg = g_ubd_big; pns = g_ubd_ns; }
         void vk_pass_report(void); vk_pass_report();
         pe = g_vkst.ns_exec; pd = g_vkst.ns_desc; pp = g_vkst.ns_pipe; ps = g_ns_submit; pb = g_ubd_bytes; pdr = g_vkst.draws; pg = g_gpu_ns; pkn = g_pkg_n; pkb = g_pkg_bytes; pkt = g_pkg_ns; psb = g_ns_set_build; psh = g_ns_set_hash; psn = g_ns_set_new; psm = g_set_memo;
     }

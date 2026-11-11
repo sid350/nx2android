@@ -1280,7 +1280,7 @@ typedef struct { uint64_t lo, hi; VkBuffer sb; VkDeviceSize so; const uint8_t *p
 enum { UBD_MAX = 512 };
 static ubd_t g_ubd[UBD_MAX]; static int g_nubd; uint64_t g_ubd_gen = 1, g_ubd_landed, g_ubd_shadows, g_ubd_bytes, g_ns_submit, g_ubd_superseded;
 static uint64_t g_ubd_seq, g_ubd_drops;   // updates recorded so far; deferred updates dropped without landing (vk_ubd_land_drop)
-uint64_t g_ubd_shc_kept, g_ubd_big;   // DM_VK_UBD_SHC: shadows kept although other ranges were updated since; shadows of 32 KB or more
+uint64_t g_ubd_shc_kept, g_ubd_big, g_ubd_ns;   // DM_VK_UBD_SHC: shadows kept although other ranges were updated since; shadows of 32 KB or more
 void vk_end_pass_land(void);
 void vk_sub_update(uint64_t dst, const void *data, uint64_t n) {
     VkBuffer db, sb; VkDeviceSize dof, so;
@@ -1434,7 +1434,9 @@ int vk_ubd_shadow(uint64_t a, uint64_t n, VkBuffer *buf, VkDeviceSize *off) {
             for (int it = 0; it < 64; it++) { if (m == 0) memcpy(hm, (const void *)(uintptr_t)a, n); else if (m == 1) memcpy(sc, hm, n); else if (m == 2) memcpy(sc, (const void *)(uintptr_t)a, n); else memcpy(hm + (it & 1) * 0, sc, n); }
             clock_gettime(CLOCK_MONOTONIC, &t1); double s = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9; r[m] = 64.0 * n / s / 1e9; }
         VKLOG("ubd copy speeds (GB/s, 64 x %llu bytes): game memory -> malloc %.2f, malloc -> scratch %.2f, game memory -> scratch %.2f, scratch -> malloc %.2f", (unsigned long long)n, r[0], r[1], r[2], r[3]); free(hm); } }
+    struct timespec tsa, tsb; clock_gettime(CLOCK_MONOTONIC, &tsa);
     uint8_t *d = vk_scratch(n, V.props.limits.minUniformBufferOffsetAlignment, buf, off); vk_ubd_read(a, n, d); g_ubd_bytes += n;
+    clock_gettime(CLOCK_MONOTONIC, &tsb); g_ubd_ns += (uint64_t)((tsb.tv_sec - tsa.tv_sec) * 1000000000ll + (tsb.tv_nsec - tsa.tv_nsec));
     c[k].a = a; c[k].n = n; c[k].gen = g_ubd_gen; c[k].seq = g_ubd_seq; c[k].fence = g_fence; c[k].drops = g_ubd_drops; c[k].b = *buf; c[k].o = *off; g_ubd_shadows++; g_ubd_big += n >= 32768;
     return 1;
 }
