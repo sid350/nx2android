@@ -1269,6 +1269,10 @@ static void vk_cross(int k, uint64_t a, uint64_t n, const vkpool_t *p) {
 static void cbuf_desc(int st, const vkshader_t *s, const dmsv_bind *b, VkDescriptorBufferInfo *bi) {
     const p_bind_buf *u = b->reg >= 0 && b->reg < 16 ? &S.ubo[st][b->reg] : NULL;
     uint64_t n = u && u->size ? (u->size > 65536 ? 65536 : u->size) : 65536; VkBuffer buf; VkDeviceSize off;
+    // DM_VK_CBUF_TRIM=1 (start-up): no more than the bytes the shader can read (gfx_vk_shader.c spv_cbuf_use), in 256-byte steps: a deferred update's shadow
+    // copies those instead of the whole binding, and an update past them no longer makes one (Breath of the Wild: ~290 shadows of ~61 KB a frame)
+    static int trim = -1; if (trim < 0) { const char *e = getenv("DM_VK_CBUF_TRIM"); trim = e && atoi(e) > 0; }
+    if (trim) { ptrdiff_t bi_ = b - s->b; uint32_t use = bi_ >= 0 && bi_ < 96 ? s->cbuse[bi_] : 0; if (use) { uint64_t t = ((uint64_t)use + 255) & ~255ull; if (t < n) n = t; } }
     vkpool_t *p = g_var_now != 9 && u && u->addr ? vk_pool_of(u->addr, 1) : NULL;
     if (!p) { *bi = (VkDescriptorBufferInfo){vk_zero_buffer(), 0, 65536}; return; }
     buf = p->buf; off = u->addr - p->lo;

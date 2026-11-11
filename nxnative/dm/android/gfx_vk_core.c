@@ -1246,9 +1246,11 @@ void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) {
 // before nearly every draw: NEO had about 145 passes for 148 draws a frame). NVN applies the update in command order, so a draw after it whose uniform
 // binding overlaps it reads a shadow: memory with the deferred updates applied in order (vk_ubd_shadow). The real copies are made in order when a pass
 // ends anyway, and at the end of the submission (vk_ubd_land), so later passes, copies, dispatches and the CPU see them as before.
-typedef struct { uint64_t lo, hi; VkBuffer sb; VkDeviceSize so; const uint8_t *p; } ubd_t;
+typedef struct { uint64_t lo, hi; VkBuffer sb; VkDeviceSize so; const uint8_t *p; uint64_t seq; } ubd_t;   // seq: g_ubd_seq when it was recorded (vk_ubd_shadow's per-range check)
 enum { UBD_MAX = 512 };
 static ubd_t g_ubd[UBD_MAX]; static int g_nubd; uint64_t g_ubd_gen = 1, g_ubd_landed, g_ubd_shadows, g_ubd_bytes, g_ns_submit, g_ubd_superseded;
+static uint64_t g_ubd_seq, g_ubd_drops;   // updates recorded so far; deferred updates dropped without landing (vk_ubd_land_drop)
+uint64_t g_ubd_shc_kept;   // DM_VK_UBD_SHC: shadows kept although other ranges were updated since
 void vk_end_pass_land(void);
 void vk_sub_update(uint64_t dst, const void *data, uint64_t n) {
     VkBuffer db, sb; VkDeviceSize dof, so;
@@ -1259,7 +1261,7 @@ void vk_sub_update(uint64_t dst, const void *data, uint64_t n) {
     for (int i = g_nubd - 1; i >= 0; i--) if (g_ubd[i].lo == dst && g_ubd[i].hi == dst + n) { memmove(&g_ubd[i], &g_ubd[i + 1], sizeof *g_ubd * (size_t)(g_nubd - i - 1)); g_nubd--; g_ubd_superseded++; break; }
     if (g_nubd == UBD_MAX) vk_end_pass_land();   // too many distinct ranges: they land now
     uint8_t *p = vk_scratch(n, 4, &sb, &so); memcpy(p, data, n);
-    g_ubd[g_nubd++] = (ubd_t){dst, dst + n, sb, so, p}; g_ubd_gen++;
+    g_ubd[g_nubd++] = (ubd_t){dst, dst + n, sb, so, p, ++g_ubd_seq}; g_ubd_gen++;
 }
 // the draw bisection (gfx_vk_exec.c draw_allowed): the outcome of this submission
 extern int g_bis_on, g_bis_lo, g_bis_hi, g_bis_trace, g_bis_var; void vk_bisect_reset_count(void);
@@ -1278,11 +1280,11 @@ static void vk_bisect_result(int ok) {
     if (g_bis_hi - g_bis_lo <= 1) { done = 1; g_bis_on = 0; g_bis_trace = g_bis_lo; VKLOG("bisection: draw %d of %d is the first the driver refuses (traced in the next submission)", g_bis_lo, draws_seen); }
     vk_bisect_reset_count();
 }
-void vk_ubd_land_drop(void) { g_nubd = 0; g_ubd_gen++; }
+void vk_ubd_land_drop(void) { g_nubd = 0; g_ubd_gen++; g_ubd_drops++; }
 // Landed updates still in flight: their copies are queued but the GPU may not have run them, so memory may not hold them yet; a shadow built on the
 // CPU (vk_ubd_read) applies them over memory until their submission completes. Without this a shadow mixed the newest update with the frame before's
 // memory (shadows detached from moving characters, far pedestrians flickering).
-typedef struct { uint64_t lo, hi, fence; const uint8_t *data; } ubd_infl_t;   // data: the update's bytes in its submission's scratch memory, which is not reused before that submission completes
+typedef struct { uint64_t lo, hi, fence; const uint8_t *data; uint64_t seq; } ubd_infl_t;   // data: the update's bytes in its submission's scratch memory, which is not reused before that submission completes
 static ubd_infl_t *g_infl; static int g_ninfl, g_capinfl;
 static void infl_prune(void) {
     uint64_t done = vk_fence_done(); int o = 0;
@@ -1296,7 +1298,7 @@ void vk_ubd_land(VkCommandBuffer cb) {   // outside a render pass
     for (int i = 0; i < g_nubd; i++) {
         if (g_ninfl == g_capinfl) { g_capinfl = g_capinfl ? 2 * g_capinfl : 256; g_infl = realloc(g_infl, sizeof *g_infl * (size_t)g_capinfl); }
         // (the bytes used to be copied into the heap here: a malloc, memcpy and free of up to 64 KB per update, for bytes the scratch memory keeps anyway)
-        g_infl[g_ninfl++] = (ubd_infl_t){g_ubd[i].lo, g_ubd[i].hi, g_fence + 1, g_ubd[i].p};   // the fence of the submission being recorded
+        g_infl[g_ninfl++] = (ubd_infl_t){g_ubd[i].lo, g_ubd[i].hi, g_fence + 1, g_ubd[i].p, g_ubd[i].seq};   // the fence of the submission being recorded
     }
     vk_img_barrier_all(cb);
     for (int i = 0; i < g_nubd; i++) { VkBuffer db; VkDeviceSize dof; if (vk_buf_at(g_ubd[i].lo, g_ubd[i].hi - g_ubd[i].lo, &db, &dof)) {
@@ -1344,11 +1346,22 @@ void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst) {
 // a uniform binding [a, a + n) that deferred updates overlap: its shadow (0 when none overlaps). Shadows are kept per (address, size) until the next update.
 int vk_ubd_shadow(uint64_t a, uint64_t n, VkBuffer *buf, VkDeviceSize *off) {
     if (!g_nubd || !vk_ubd_overlaps(a, n)) return 0;   // (a binding no deferred update touches reads memory on the GPU, after the in-flight copies: no shadow needed)
-    enum { NC = 64 }; static struct { uint64_t a, n, gen; VkBuffer b; VkDeviceSize o; } c[NC];
+    enum { NC = 256 }; static struct { uint64_t a, n, gen, seq, fence, drops; VkBuffer b; VkDeviceSize o; } c[NC];
     unsigned k = (unsigned)((a ^ n * 0x9E3779B97F4A7C15ull) >> 6) % NC;
     extern int g_x_noshc; if (c[k].a == a && c[k].n == n && c[k].gen == g_ubd_gen && !g_x_noshc) { *buf = c[k].b; *off = c[k].o; return 1; }
+    // DM_VK_UBD_SHC=1 (start-up): any update anywhere used to make every range's shadow again (Breath of the Wild: about 450 updates and 290 shadows of ~61 KB
+    // a frame, 17.8 MB of copies, a fifth of the replay thread). A shadow still holds what a read of its range sees while no update recorded after it overlaps
+    // that range: updates that were landed since are in memory or in flight with the same bytes, and a superseding update is a newer one. It is kept within
+    // the submission it was made in (its scratch memory is that submission's) and until deferred updates are dropped without landing
+    static int shc = -1; if (shc < 0) { const char *e = getenv("DM_VK_UBD_SHC"); shc = e && atoi(e) > 0; }
+    if (shc && !g_x_noshc && c[k].a == a && c[k].n == n && c[k].fence == g_fence && c[k].drops == g_ubd_drops) {
+        int newer = 0;
+        for (int i = g_nubd - 1; i >= 0 && !newer; i--) if (g_ubd[i].seq > c[k].seq && g_ubd[i].lo < a + n && a < g_ubd[i].hi) newer = 1;
+        for (int i = g_ninfl - 1; i >= 0 && !newer; i--) if (g_infl[i].seq > c[k].seq && g_infl[i].lo < a + n && a < g_infl[i].hi) newer = 1;
+        if (!newer) { c[k].gen = g_ubd_gen; g_ubd_shc_kept++; *buf = c[k].b; *off = c[k].o; return 1; }
+    }
     uint8_t *d = vk_scratch(n, V.props.limits.minUniformBufferOffsetAlignment, buf, off); vk_ubd_read(a, n, d); g_ubd_bytes += n;
-    c[k].a = a; c[k].n = n; c[k].gen = g_ubd_gen; c[k].b = *buf; c[k].o = *off; g_ubd_shadows++;
+    c[k].a = a; c[k].n = n; c[k].gen = g_ubd_gen; c[k].seq = g_ubd_seq; c[k].fence = g_fence; c[k].drops = g_ubd_drops; c[k].b = *buf; c[k].o = *off; g_ubd_shadows++;
     return 1;
 }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }

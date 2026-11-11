@@ -155,6 +155,37 @@ static int spv_is_vec4(const uint32_t *w, uint32_t fn, uint32_t t) {   // a vec4
         if (w[found + 3] != 4) return 0; for (i = 5; i < fn;) { if ((w[i] & 0xffff) == 22 && w[i + 1] == w[found + 2]) return w[i + 2] == 32; i += w[i] >> 16; } return 0; }
     return 0;
 }
+// The bytes of each constant buffer binding (RK_CBUF) the shader can read (vkshader_t cbuse, 0: not known, the whole binding). The translator declares every
+// constant buffer as a block of 4,096 vec4s (64 KB) and indexes it with OpAccessChain(var, 0, index[, component]); when every index is a constant, the shader
+// reads no further than the largest one. Breath of the Wild: 92% of its 51,682 constant buffer bindings read 2 KB or less (41% 256 bytes), 8% index them at
+// run time. Any other use of the variable (a load of the whole block, an index that is not a constant) leaves it unknown. gfx_vk_exec.c cbuf_desc trims a
+// binding to it (DM_VK_CBUF_TRIM=1): a deferred update's shadow then copies the bytes the shader reads instead of 64 KB
+static void spv_cbuf_use(vkshader_t *s, const uint32_t *w, uint32_t nw) {
+    for (int i = 0; i < s->nbind && i < 96; i++) s->cbuse[i] = 0;
+    enum { NV = 32 }; struct { uint32_t id, binding; int64_t mx; int bad; } v[NV]; int nv = 0;
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) return;
+        if (op == 71 && n == 4 && w[i + 2] == 33 && nv < NV) { v[nv].id = w[i + 1]; v[nv].binding = w[i + 3]; v[nv].mx = -1; v[nv].bad = 0; nv++; }   // OpDecorate Binding
+        i += n; }
+    if (!nv) return;
+    // the constants (OpConstant of a 32-bit integer: the value is the only word)
+    uint32_t bound = w[3]; uint32_t *cval = bound < (1u << 22) ? calloc(bound, sizeof *cval) : NULL; uint8_t *isc = cval ? calloc(bound, 1) : NULL; if (!isc) { free(cval); return; }
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (op == 43 && n == 4 && w[i + 2] < bound) { isc[w[i + 2]] = 1; cval[w[i + 2]] = w[i + 3]; }
+        i += n; }
+    for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff;
+        if (op == 5 || op == 6 || op == 71 || op == 72 || op == 15 || op == 59) { i += n; continue; }   // names, decorations, the entry point's interface, the variable itself
+        for (int k = 0; k < nv; k++) {
+            if ((op == 65 || op == 66) && n >= 5 && w[i + 3] == v[k].id) {   // OpAccessChain / OpInBoundsAccessChain on the block: member 0, then the vec4 index
+                if (n < 6 || !(w[i + 5] < bound && isc[w[i + 5]])) v[k].bad = 1; else if ((int64_t)cval[w[i + 5]] > v[k].mx) v[k].mx = cval[w[i + 5]];
+                for (uint32_t j = i + 4; j < i + n; j++) if (w[j] == v[k].id) v[k].bad = 1;
+                continue; }
+            for (uint32_t j = i + 1; j < i + n; j++) if (w[j] == v[k].id) { v[k].bad = 1; break; }   // any other use
+        }
+        i += n; }
+    free(cval); free(isc);
+    for (int i = 0; i < s->nbind && i < 96; i++) if (s->b[i].kind == RK_CBUF)
+        for (int k = 0; k < nv; k++) if (v[k].binding == s->b[i].binding && !v[k].bad) { uint64_t used = (uint64_t)(v[k].mx + 1) * 16; s->cbuse[i] = (uint32_t)(used ? used : 16); }
+}
 static void spv_io_locs(const uint32_t *w, uint32_t nw, uint32_t *in, uint32_t *out) {
     *in = *out = 0; uint32_t fn = nw;
     for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16; if (!n) return; if ((w[i] & 0xffff) == 54) { fn = i; break; } i += n; }
@@ -349,6 +380,7 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
               if (*x == 37) *x = 79; else if (*x == 40) *x = 80; else if (*x == 43) *x = 81; }
           i += n; } }
     spv_io_locs(w, nw, &s->in_locs, &s->out_locs);
+    spv_cbuf_use(s, w, nw);
     VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, (size_t)nw * 4, w};
     VkResult vr = vkCreateShaderModule(V.dev, &ci, NULL, &s->mod); s->spv = w; s->nspv = nw;
     if (vr) { VKLOG("[RED] shader %016llx: vkCreateShaderModule %d", (unsigned long long)key, vr); free(w); free(s); nvn_hm_put(&g_shaders, &hk, (void *)1); pthread_mutex_unlock(&g_sh_mu); return NULL; }
