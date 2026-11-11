@@ -14,3 +14,10 @@ env	DM_VK_CB_DRAWS=32
 env	DM_VK_FDZ=0
 env	DM_NVN_ASYNC=1
 env	DM_PIN_REPLAY=prime
+# Reference 54 fps (2026-11-11, tag botw-ref-54fps, Turnip Gen8 V39 Patched through --vulkan-driver, the player's save on the Great Plateau, walking and turning
+# the camera): with the three settings below, frame p50 18.4-18.9 ms (about 54 fps), p95 about 22 ms, 4,500-4,800 draws, replay 8.9 ms (descriptor sets 4.7),
+# GPU about 6 ms; the SoC reached 64 C and the GPU clock was later capped at 607 MHz (thermal_pwrlevel 6). The default pacing holds this at 30 fps (p95 49 ms).
+# Not on by default: DM_FPS_HOLD=off runs the game at whatever the chain gives (45-60 fps here) and heats the device.
+#env	DM_VK_UBD_COVER=1
+#env	DM_VK_MT_REPLAY=1
+#env	DM_FPS_HOLD=off
