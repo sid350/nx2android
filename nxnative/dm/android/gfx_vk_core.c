@@ -733,7 +733,37 @@ void mtl_pool_del(const void *mem) {
         pool_note(1, p.hi - p.lo, pool_ns() - t0);
     }
 }
+// DM_VK_POOL_TC=1 (start-up): vk_pool_of's per-thread cache in a static table claimed by thread (pthread_self, a register read) instead of a __thread variable, whose
+// every access from this dlopen'ed library went through the linker's TLS descriptor resolver (tlsdesc_resolver_dynamic: 1.5% of Breath of the Wild's replay), and 16
+// pools instead of 4 (vk_pool_of itself was 6.2% of it, most of it the locked search after a miss)
+enum { POOL_TC_THREADS = 8, POOL_TC_N = 16 };
+typedef struct { uint32_t gen; vkpool_t *p[POOL_TC_N]; } pool_tc_t;
+static pool_tc_t g_pool_tc[POOL_TC_THREADS]; static uintptr_t g_pool_tc_owner[POOL_TC_THREADS];
+static pool_tc_t *pool_tc(void) {
+    uintptr_t me = (uintptr_t)pthread_self();
+    for (int i = 0; i < POOL_TC_THREADS; i++) { uintptr_t o = __atomic_load_n(&g_pool_tc_owner[i], __ATOMIC_ACQUIRE); if (o == me) return &g_pool_tc[i]; if (!o) {
+        uintptr_t z = 0; if (__atomic_compare_exchange_n(&g_pool_tc_owner[i], &z, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return &g_pool_tc[i]; if (z == me) return &g_pool_tc[i]; } }
+    return NULL;   // more threads than slots: the __thread cache
+}
 vkpool_t *vk_pool_of(uint64_t addr, uint64_t len) {
+    static int tc_on = -1; if (tc_on < 0) { const char *e = getenv("DM_VK_POOL_TC"); tc_on = e && atoi(e) > 0; }
+    pool_tc_t *t = tc_on ? pool_tc() : NULL;
+    if (t) {
+        uint32_t g = __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE) + 1;
+        if (t->gen == g) for (int i = 0; i < POOL_TC_N; i++) { vkpool_t *p = t->p[i]; if (!p) break; if (addr >= p->lo && addr + len <= p->hi) {
+            if (i) { memmove(&t->p[1], &t->p[0], (size_t)i * sizeof *t->p); t->p[0] = p; } return p; } }
+        vkpool_t *r = NULL; int across = 0;
+        pthread_rwlock_rdlock(&g_pool_mu);
+        int lo = 0, hi = g_npool;
+        while (lo < hi) { int m = (lo + hi) / 2; if (g_pool[g_pool_ord[m]].lo <= addr) lo = m + 1; else hi = m; }
+        if (lo > 0) { vkpool_t *p = &g_pool[g_pool_ord[lo - 1]]; if (addr + len <= p->hi) r = p; }
+        if (!r) for (int i = 0; i < g_npool; i++) if (addr >= g_pool[i].lo && addr + len <= g_pool[i].hi) { r = &g_pool[i]; break; }
+                                                 else if (addr >= g_pool[i].lo && addr < g_pool[i].hi && addr + len <= g_pool[i].end) across = 1;
+        pthread_rwlock_unlock(&g_pool_mu);
+        if (r) { if (t->gen != g) { memset(t, 0, sizeof *t); t->gen = g; } memmove(&t->p[1], &t->p[0], (POOL_TC_N - 1) * sizeof *t->p); t->p[0] = r; }
+        if (!r && across) { static uint64_t n; uint64_t k = ++n; if (!(k & (k - 1))) LOG("[RED] [vk] %llu ranges across two chunks of a memory pool (ZC_CHUNK; this one %#llx +%#llx): no buffer for them", (unsigned long long)k, (unsigned long long)addr, (unsigned long long)len); }
+        return r;
+    }
     // the last pools this thread found, while none was added or removed: the replay looks up every buffer binding of every draw, and the read lock alone was ~6% of it
     static __thread struct { uint32_t gen; vkpool_t *p[4]; } c;   // gen: g_pool_gen + 1 (0: empty)
     uint32_t g = __atomic_load_n(&g_pool_gen, __ATOMIC_ACQUIRE) + 1;
