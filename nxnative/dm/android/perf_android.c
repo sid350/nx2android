@@ -127,8 +127,17 @@ static void hint_threads_scan(int32_t self) {
 // DM_PIN_REPLAY (start-up): the replay thread (DM_NVN_ASYNC, hle_nvn.c replay_main) kept to the fastest cores. prime: the cores of the highest maximum clock
 // (a Snapdragon 8+ Gen 1's Cortex-X2), big: every core above the lowest maximum clock. Left to the scheduler, Unicorn Overlord's battle map replay took
 // 13 to 20 ms a frame from run to run with the same ~3,500 draws
+// DM_PIN_REPLAY / DM_PIN_MAIN as a list of CPU numbers ("6", "7", "0,1,2"): exactly those cores. 1 when the value was such a list (and the affinity was set or refused)
+static int pin_list(const char *e, const char *what) {
+    if (!e || *e < '0' || *e > '9') return 0;
+    cpu_set_t set; CPU_ZERO(&set); char l[96]; size_t o = 0;
+    for (const char *q = e; *q;) { char *x; long c = strtol(q, &x, 10); if (x == q) break; if (c >= 0 && c < 32) { CPU_SET(c, &set); o += snprintf(l + o, sizeof l - o, " %ld", c); } q = *x ? x + 1 : x; }
+    if (sched_setaffinity(0, sizeof set, &set)) LOG("[perf] %s: sched_setaffinity refused", what); else LOG("[perf] %s on CPUs%s (listed)", what, l);
+    return 1;
+}
 void dm_perf_replay_thread(void) {
     const char *e = getenv("DM_PIN_REPLAY"); if (!e || !*e || !strcmp(e, "0")) return;
+    if (pin_list(e, "replay thread")) return;
     int prime = !strcmp(e, "prime"); long n = sysconf(_SC_NPROCESSORS_CONF); if (n > 32) n = 32;
     long mhz[32] = {0}, hi = 0, lo = 0;
     for (long c = 0; c < n; c++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c); FILE *f = fopen(p, "r");
@@ -145,6 +154,7 @@ void dm_perf_replay_thread(void) {
 // thread (~12 ms of CPU a frame, the frame's critical path once the replay was cheaper) moved between cores 0, 3, 5 and 6 while the replay held the prime cores
 void dm_perf_main_thread(void) {
     const char *e = getenv("DM_PIN_MAIN"); if (!e || !*e || !strcmp(e, "0")) return;
+    if (pin_list(e, "the game's main thread")) return;
     int prime = !strcmp(e, "prime"); long n = sysconf(_SC_NPROCESSORS_CONF); if (n > 32) n = 32;
     long mhz[32] = {0}, hi = 0, lo = 0;
     for (long c = 0; c < n; c++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c); FILE *f = fopen(p, "r");
