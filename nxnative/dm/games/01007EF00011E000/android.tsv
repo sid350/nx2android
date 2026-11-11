@@ -1,0 +1,16 @@
+# The Legend of Zelda: Breath of the Wild on Android (base v0 + update 1.9.0 = v1114112, DLC Master Trials)
+# Tested 2026-11-11 on the Red Magic Astra NP05J (Snapdragon 8 Elite, Adreno 830, Android 16), Qualcomm's driver 512.800: the boot, the logos, the opening
+# to the Shrine of Resurrection, about 2.5 minutes a run, no device lost. Docked (the game's 1600x900 into 1920x1080): 20 fps, replay 37 ms, GPU 35 ms a frame.
+# With Tears of the Kingdom's settings (handheld, DM_VK_FDZ=0, DM_NVN_ASYNC=1, DM_PIN_REPLAY=prime): the opening cutscene 20 -> 30 fps (replay 14, GPU 12 ms);
+# the shrine with Link controllable (3,300-3,600 draws) still 20 fps: replay 18, GPU 15.6 ms, frame 50 ms. DM_VK_MT_REPLAY=1 made it worse (replay 22-25 ms),
+# DM_RENDER_SCALE=0.75 left the GPU time as it was (draw-bound, not pixel-bound).
+status	experimental
+tested	v1114112 Red Magic Astra NP05J (Snapdragon 8 Elite, Adreno 830, Android 16)
+package	org.nx2a.t01007ef00011e000
+orientation	landscape
+setting	docked=0
+env	DM_ADAPTIVE_FPS=0
+env	DM_VK_CB_DRAWS=32
+env	DM_VK_FDZ=0
+env	DM_NVN_ASYNC=1
+env	DM_PIN_REPLAY=prime
