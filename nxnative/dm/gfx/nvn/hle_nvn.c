@@ -1874,6 +1874,18 @@ static void fstep_tick(const win_t *o) {
     // refresh more than its hold: a cheap 50 ms frame shows 54.5 ms at 165 Hz, which counted as late kept the hold at 20 fps for good
     int hz = front_screen_max_fps(); g_fs.shown_slack = hz > 60 && hz % 60 && mtl_link_active() ? 60.0 / hz : 0;
     int cslow = fstep_cpu_slowed(o->presents), gslow = nvn_fstep_gpu_slowed(&g_fg, gpu, k0 ? k0 : kmin, kmin, pphase) && dm_thermal_now() <= 1 && !dm_low_power_now();   // same gates as the CPU's
+    // DM_VK_PACE_STICKY=1 (start-up): no hold past 2 vsyncs (a late frame is shown when it is ready and its time paid back, instead of three late frames moving the game
+    // to 20 fps for seconds), no probes, and once two trials back to 60 fps have failed, none again until the cap changes. Breath of the Wild on the Adreno 830 with
+    // Turnip: a frame's chain (the game's main thread ~12 ms, the replay ~13-18 ms, GPU ~6 ms) sits near 33 ms, so the trials to 60 failed with late frames
+    // every few seconds and frames over 33 ms put it on 20 fps for a while: the "uneven 30 with drops to 20" the player saw
+    static int sticky = -1, floor2, cap_was; if (sticky < 0) { const char *e = getenv("DM_VK_PACE_STICKY"); sticky = e && atoi(e) > 0; if (sticky) LOG("[nvn] frame step: sticky pacing (DM_VK_PACE_STICKY)"); }
+    if (sticky && !fixed) {
+        if (c != cap_was) { cap_was = c; floor2 = 0; }
+        if (!floor2 && kmin < 2 && g_fs.failed >= 2) { floor2 = 1; LOG("[nvn] frame step: two trials back to %d fps failed, staying at 30 (DM_VK_PACE_STICKY)", c); }
+        if (floor2 && kmin < 2) kmin = 2;
+        if (kmax > 2) kmax = 2; if (kmax < kmin) kmax = kmin;
+        cslow = gslow = 0; g_fs.cref = 0;   // (cref is what nvn_fstep_same starts the other probes from)
+    }
     int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
     __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED); atomic_store(&g_fs_k, g_fs.k);
     held[g_fs.k]++; if (fixed) fixed_sum += (uint64_t)n;   // the stubs count only the host's steps
