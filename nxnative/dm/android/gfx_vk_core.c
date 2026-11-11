@@ -1250,7 +1250,7 @@ typedef struct { uint64_t lo, hi; VkBuffer sb; VkDeviceSize so; const uint8_t *p
 enum { UBD_MAX = 512 };
 static ubd_t g_ubd[UBD_MAX]; static int g_nubd; uint64_t g_ubd_gen = 1, g_ubd_landed, g_ubd_shadows, g_ubd_bytes, g_ns_submit, g_ubd_superseded;
 static uint64_t g_ubd_seq, g_ubd_drops;   // updates recorded so far; deferred updates dropped without landing (vk_ubd_land_drop)
-uint64_t g_ubd_shc_kept;   // DM_VK_UBD_SHC: shadows kept although other ranges were updated since
+uint64_t g_ubd_shc_kept, g_ubd_big;   // DM_VK_UBD_SHC: shadows kept although other ranges were updated since; shadows of 32 KB or more
 void vk_end_pass_land(void);
 void vk_sub_update(uint64_t dst, const void *data, uint64_t n) {
     VkBuffer db, sb; VkDeviceSize dof, so;
@@ -1361,7 +1361,7 @@ int vk_ubd_shadow(uint64_t a, uint64_t n, VkBuffer *buf, VkDeviceSize *off) {
         if (!newer) { c[k].gen = g_ubd_gen; g_ubd_shc_kept++; *buf = c[k].b; *off = c[k].o; return 1; }
     }
     uint8_t *d = vk_scratch(n, V.props.limits.minUniformBufferOffsetAlignment, buf, off); vk_ubd_read(a, n, d); g_ubd_bytes += n;
-    c[k].a = a; c[k].n = n; c[k].gen = g_ubd_gen; c[k].seq = g_ubd_seq; c[k].fence = g_fence; c[k].drops = g_ubd_drops; c[k].b = *buf; c[k].o = *off; g_ubd_shadows++;
+    c[k].a = a; c[k].n = n; c[k].gen = g_ubd_gen; c[k].seq = g_ubd_seq; c[k].fence = g_fence; c[k].drops = g_ubd_drops; c[k].b = *buf; c[k].o = *off; g_ubd_shadows++; g_ubd_big += n >= 32768;
     return 1;
 }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
