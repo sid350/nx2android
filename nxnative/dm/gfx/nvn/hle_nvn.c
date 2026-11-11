@@ -716,7 +716,11 @@ static uint64_t nvn_fence_now(void); static int nvn_fence_wait(uint64_t f, uint6
 static uint64_t g_frame;
 // DM_NVN_SEQ=N (live, a DM_CTL env line): the next N frames' submissions, fences, acquires, sync waits and presents in order, with thread and time
 // (how Xenoblade Chronicles 3's render thread was found waiting in SyncWait on the acquire sync for its whole frame's GPU work)
-static int seq_on(void) { static uint64_t until; const char *e = getenv("DM_NVN_SEQ"); if (e && atoi(e)) { until = g_frame + (uint64_t)atoi(e); setenv("DM_NVN_SEQ", "0", 1); } return g_frame < until; }
+// DM_NVN_SEQ_FROM=<frame> (start-up) with DM_NVN_SEQ_N=<frames>: the same, from that frame on (a release build takes no DM_CTL line; the gameplay starts well after the boot)
+static int seq_on(void) { static uint64_t until; const char *e = getenv("DM_NVN_SEQ"); if (e && atoi(e)) { until = g_frame + (uint64_t)atoi(e); setenv("DM_NVN_SEQ", "0", 1); }
+    static long long from = -2; if (from == -2) { const char *f = getenv("DM_NVN_SEQ_FROM"); from = f ? atoll(f) : -1; }
+    if (from >= 0 && g_frame >= (uint64_t)from) { const char *n = getenv("DM_NVN_SEQ_N"); until = g_frame + (uint64_t)(n ? atoll(n) : 3); from = -1; }
+    return g_frame < until; }
 #define SEQ(...) do { if (seq_on()) { char sb_[256]; snprintf(sb_, sizeof sb_, __VA_ARGS__); LOG("[seq] f%llu t%lx %.3f %s", (unsigned long long)g_frame, (unsigned long)(uintptr_t)pthread_self(), now_ns() / 1e6, sb_); } } while (0)
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = nvn_fence_now(); SEQ("fence %p", (void *)s); }
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value

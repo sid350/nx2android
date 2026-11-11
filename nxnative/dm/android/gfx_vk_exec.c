@@ -207,6 +207,13 @@ void vk_exec_reset(void) {   // a new submission: NVN state does not carry over 
     g_rc_npend = 0; g_rc_skip = 0;
     { void vk_tex_release_drain(void); vk_tex_release_drain(); }   // Finalized textures' CPU-written marks that no queued job needs any more (gfx_vk_tex.c)
     S.pass_open = 0; S.bound_pipe = VK_NULL_HANDLE; g_cb_draws = 0; g_ord_parts = 0; g_psplit_now = 0; g_set_epoch++; x_read();
+    // DM_VK_CB_SPREAD=1 (start-up): the ordinary cuts spread over the whole submission. Only 15 are made per submission, every DM_VK_CB_DRAWS draws, so with
+    // 32 they ended after ~480 draws and the rest went to the GPU at the submission's end: Breath of the Wild (~4,700 draws a frame in two submissions) had the
+    // GPU still at work 9.5 ms after the replay ended ([timeline] GPU tail), and its main thread waited that out in nvnSyncWait. With it the interval is at least
+    // the larger of the last two submissions' draws / 15
+    { static int spread = -1; static uint64_t d0, last[2]; if (spread < 0) { const char *e = getenv("DM_VK_CB_SPREAD"); spread = e && atoi(e) > 0; }
+      if (spread) { uint64_t d = g_vkst.draws - d0; d0 = g_vkst.draws; last[1] = last[0]; last[0] = d; uint64_t big = last[0] > last[1] ? last[0] : last[1];
+                    int want = (int)(big / 15); if (g_x_cbdraws > 0 && want > g_x_cbdraws) g_x_cbdraws = want; } }
     if (g_prof_on) { extern uint64_t g_pkg_ns, g_pkg_n; memset(g_prof_ns, 0, sizeof g_prof_ns); g_prof_t0 = tick(); g_prof_pkg0 = g_pkg_ns; g_prof_npkg0 = g_pkg_n; g_prof_pipes0 = g_vkst.pipes_built; }
     { extern volatile int g_vk_samp_log; if (g_vk_samp_log > 0) VKLOG("submission begins (present %llu, thread %d)", (unsigned long long)g_tex_frame, (int)gettid()); }
 }
