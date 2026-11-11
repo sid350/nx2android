@@ -4,6 +4,8 @@
 # With Tears of the Kingdom's settings (handheld, DM_VK_FDZ=0, DM_NVN_ASYNC=1, DM_PIN_REPLAY=prime): the opening cutscene 20 -> 30 fps (replay 14, GPU 12 ms);
 # the shrine with Link controllable (3,300-3,600 draws) still 20 fps: replay 18, GPU 15.6 ms, frame 50 ms. DM_VK_MT_REPLAY=1 made it worse (replay 22-25 ms),
 # DM_RENDER_SCALE=0.75 left the GPU time as it was (draw-bound, not pixel-bound).
+# porter port --vulkan-driver with Turnip Gen8 V39 Patched (StevenMXZ/freedreno_turnip-CI, Mesa 27.0.0-devel, 2026-11-07): the shrine at 30 fps (3,100-4,700
+# draws: replay 14-17 ms, GPU 12-15 ms, frame p50 33 ms; Qualcomm's 18-24 / 16-20 / 48-50), 8 of 10 windows of 300 frames held, the rest loading; picture correct, SoC 43 °C.
 status	experimental
 tested	v1114112 Red Magic Astra NP05J (Snapdragon 8 Elite, Adreno 830, Android 16)
 package	org.nx2a.t01007ef00011e000
