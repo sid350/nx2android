@@ -886,6 +886,7 @@ static void hostseg_release(uintptr_t lo, uintptr_t hi) {
 }
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
     const pool_t *pl = (const pool_t *)p;
+    if (pl) __atomic_store_n(&CB(c)->cmd_size, n, __ATOMIC_RELAXED);   // GetCommandMemorySize: the memory the game added, whether the host records into it or into a segment it lends
     if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); } uint32_t sz = HOSTSEG_SZ; if (!pl && n >= 64) { sz = HOSTSEG_MIN; while (sz < n && sz < HOSTSEG_SZ) sz <<= 1; }
         cmd_new_segment(CB(c), hostseg_take(CB(c), sz), sz); return; }
     if (!pl->mem) { LOG("[RED] AddCommandMemory: pool has no CPU storage"); return; }
@@ -2126,7 +2127,8 @@ _Static_assert(sizeof(map_req) == 0x28, "NVNmappingRequest");
 // that set it), and the host reads textures of a sparse pool through it (nvn_sparse_copy): such a texture is uploaded from what the table points at, with unmapped pages read as 0,
 // and uploaded again only when a mapping in its range changes or the CPU writes a physical page behind it (nvn_sparse_since; the physical pools are dirty-tracked). The game fills
 // its sparse textures (flag 0x20, 32 GB into the pool) that way: it writes the tiles on the CPU into 4 MB physical pools, then maps them; no GPU copy writes them
-// Every virtual pool gets that range at Initialize, since the game may create its textures and buffers before mapping anything; its first mapping request then decides (MapVirtual):
+// With the profile's small_vpool_sparse on, every virtual pool gets that range at Initialize (without it only those larger than the application pool, as before), since the game may
+// create its textures and buffers before mapping anything; its first mapping request then decides (MapVirtual):
 // one that maps the whole pool from offset 0 keeps the alias above (Mario's pool: the range is given back, and no object of the pool came before it), anything else makes the pool
 // sparse. OCTOPATH TRAVELER (Unreal Engine 4) gives each streamed texture a virtual pool of its own (0x20000 to 0x560000 bytes, flags 0x2a1), creates the texture in it, maps its mip
 // tail from a 4 MB physical pool and later the higher mips from other pages of it, after writing their texels there on the CPU: aliased, the texture had no storage (created before any
@@ -2138,8 +2140,11 @@ static struct vpool **g_vp; static int g_nvp, g_cvp;   // the pools with a range
 static pthread_mutex_t g_vp_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_vp_gen;   // bumped per mapping request
 static struct vpool *vpool_of(const pool_t *o) { return o->vp; }
-static uint8_t *vpool_reserve(pool_t *o) {   // → the reserved range, or NULL
+static uint8_t *vpool_reserve(pool_t *o) {   // → the reserved range, or NULL (the pool takes the alias path of MapVirtual)
     if (!(o->flags & 0x200)) return NULL;
+    // A pool no larger than the application pool keeps main's alias unless the profile asks (small_vpool_sparse on: OCTOPATH TRAVELER's per-texture pools); a game that maps
+    // a small pool in parts the alias accepts would otherwise become page-table-only on Android
+    if (o->size <= DM_GAME_APP_POOL && !DM_GAME_SMALL_VPOOL_SPARSE) return NULL;
 #if TARGET_OS_IPHONE   // 1 GB: Monster Hunter Rise's buffers stay under 0x20100000 through its opening, its textures (32 GB in) are read through the page table, and 4 GB guest + 1 GB stays near the 5 GB proven on a phone
     uint64_t len = o->size < (1ull << 30) ? o->size : 1ull << 30;
 #else
@@ -2148,11 +2153,19 @@ static uint8_t *vpool_reserve(pool_t *o) {   // → the reserved range, or NULL
     len = (len + (uint64_t)getpagesize() - 1) & ~((uint64_t)getpagesize() - 1);
     void *a = mmap(NULL, len, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (a == MAP_FAILED) { LOG("[RED] virtual pool %p: cannot reserve %#llx bytes of address space (errno %d)", (const void *)o, (unsigned long long)len, errno); return NULL; }
+    // An allocation that fails gives the range back and the pool takes the alias path (MapVirtual), as on main, instead of stopping the game
     struct vpool *v = calloc(1, sizeof *v);
-    if (!v || !(v->pt = calloc((o->size + (2u << 20) - 1) >> 21, sizeof *v->pt))) die("sparse pool allocation failed");
+    if (!v || !(v->pt = calloc((o->size + (2u << 20) - 1) >> 21, sizeof *v->pt))) {
+        LOG("[RED] virtual pool %p (%#llx bytes): no memory for its page table: it keeps the alias", (const void *)o, (unsigned long long)o->size);
+        munmap(a, len); free(v); return NULL;
+    }
     v->pool = o; v->base = a; v->len = len; v->size = o->size;
     pthread_mutex_lock(&g_vp_mu);
-    if (g_nvp == g_cvp && !(g_vp = realloc(g_vp, (g_cvp = g_cvp ? 2 * g_cvp : 64) * sizeof *g_vp))) die("sparse pool table allocation failed");
+    if (g_nvp == g_cvp) {
+        int nc = g_cvp ? 2 * g_cvp : 64; struct vpool **t = realloc(g_vp, nc * sizeof *g_vp);
+        if (!t) { pthread_mutex_unlock(&g_vp_mu); LOG("[RED] virtual pool %p: no memory for the pool table (%d pools): it keeps the alias", (const void *)o, g_nvp); munmap(a, len); free(v->pt); free(v); return NULL; }
+        g_vp = t; g_cvp = nc;
+    }
     g_vp[g_nvp++] = v; o->vp = v;
     o->vmode = o->size > DM_GAME_APP_POOL ? 2 : 0;
     pthread_mutex_unlock(&g_vp_mu);
@@ -2435,9 +2448,13 @@ NVN_NOPROTO(nvnWindowSetNumActiveTextures, void, NVNwindow *w, int n) { (void)w;
 NVN(nvnCommandBufferGetCommandMemoryUsed, size_t, const NVNcommandBuffer *c) { const cmd_t *m = (const cmd_t *)c;
     return m->begin ? (size_t)m->used : 0; }
 NVN(nvnCommandBufferGetControlMemoryUsed, size_t, const NVNcommandBuffer *c) { (void)c; return 0; }
-// Size and free bytes of the command memory the game last added (DRAGON QUEST XI S, Unreal Engine 4.18): as in NVN, size = used + free; free is what is left in the current segment
+// Free bytes of the command memory (DRAGON QUEST XI S, Unreal Engine 4.18): what is left in the current segment
 NVN(nvnCommandBufferGetCommandMemoryFree, size_t, const NVNcommandBuffer *c) { const cmd_t *m = (const cmd_t *)c; return m->cur && m->end > m->cur ? (size_t)(m->end - m->cur) : 0; }
-NVN(nvnCommandBufferGetCommandMemorySize, size_t, const NVNcommandBuffer *c) { return h_nvnCommandBufferGetCommandMemoryUsed(c) + h_nvnCommandBufferGetCommandMemoryFree(c); }
+// Size, as NVN defines it: the byte count the game last passed to AddCommandMemory (cmd_size), which records and host-lent segments leave alone. It used to be used + free summed
+// per call. Super Smash Bros. Ultimate's two render dispatch threads take command buffers from one pool under a lock, and when it runs out std::sort it by this size while the other
+// thread is still recording into a buffer it took: a record landing between the two reads gave one buffer two sizes within one sort, and libc++'s unguarded partition can then run
+// off the vector (upstream nxnative 843081d0: CRASH sig=11 addr=0x50 pc=main+0x385201c, rare as a battle starts; read from the disassembly, not caught live)
+NVN(nvnCommandBufferGetCommandMemorySize, size_t, const NVNcommandBuffer *c) { return __atomic_load_n(&((const cmd_t *)c)->cmd_size, __ATOMIC_RELAXED); }
 NVN_NOPROTO(nvnCommandBufferSetCommandMemoryCallbackEnabled, void, NVNcommandBuffer *c, uint32_t on) { (void)c; (void)on; }
 
 // nvnProgramSetShadersExt (NVN 55): each stage is 0x18 bytes = NVNshaderData{data, control} + one 8-byte extension field (filled from SMBW main 0x1074ff0).
@@ -2504,11 +2521,13 @@ int nvn_host_readable(uint64_t a, uint64_t n) {
 // Textures of a sparse pool, read through its page table (see the sparse pools above): whether a pool is one, a copy of a texture's bytes (unmapped pages read as 0; → bytes not mapped),
 // whether its content may have changed since an upload (a mapping in its range newer than gen, or a physical page behind it written after the dirty-page stamp), and the write
 // protection of the physical pages behind it (taken before an upload, as for any packaged texture)
+// A texture's pool pointer is the game's NVNmemoryPool: after Finalize the game may reuse that memory, so vp is read only from a live virtual pool (magic POOL, flag 0x200)
+static struct vpool *vpool_live(const void *pool) { const pool_t *p = pool; return p && p->magic == MAGIC('P', 'O', 'O', 'L') && (p->flags & 0x200) ? p->vp : NULL; }
 static struct vpool *vpool_at(const void *pool, uint64_t a) {   // caller holds g_vp_mu
-    struct vpool *v = pool ? ((const pool_t *)pool)->vp : NULL;
+    struct vpool *v = vpool_live(pool);
     return v && a >= (uint64_t)(uintptr_t)v->base && a < (uint64_t)(uintptr_t)v->base + v->size ? v : NULL;
 }
-int nvn_sparse_pool(const void *pool) { return pool && ((const pool_t *)pool)->vp; }   // no lock: set at Initialize, cleared at the first mapping (an aliased pool) or Finalize; called per texture lookup
+int nvn_sparse_pool(const void *pool) { return vpool_live(pool) != NULL; }   // no lock: set at Initialize, cleared at the first mapping (an aliased pool) or Finalize; called per texture lookup
 uint64_t nvn_sparse_gen(void) { return atomic_load(&g_vp_gen); }
 uint64_t nvn_sparse_copy(const void *pool, void *dst, uint64_t a, uint64_t n) {
     pthread_mutex_lock(&g_vp_mu); struct vpool *v = vpool_at(pool, a); uint64_t miss = 0;
