@@ -1097,7 +1097,14 @@ void *vk_scratch(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, b->size, POOL_USAGE, VK_SHARING_MODE_EXCLUSIVE};
     VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &b->b));
     VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, b->b, &req);
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
+    // DM_VK_SCRATCH_CACHED=1 (start-up): scratch memory from a host-cached coherent type where the device has one. Uncached, the CPU reads it at 2.25 GB/s (Adreno 830,
+    // Turnip) and writes it through write-combining: Breath of the Wild writes ~18 MB of uniform shadows into it a frame (288 copies of 64 KB, 2.3 ms)
+    static int sc_cached = -1; if (sc_cached < 0) { const char *e = getenv("DM_VK_SCRATCH_CACHED"); sc_cached = e && atoi(e) > 0; }
+    uint32_t mt = UINT32_MAX;
+    if (sc_cached) { mt = vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 0);
+        static int said; if (!said++) LOG("[vk] scratch memory: %s (DM_VK_SCRATCH_CACHED)", mt == UINT32_MAX ? "no host-cached coherent type, uncached as before" : "host-cached coherent"); }
+    if (mt == UINT32_MAX) mt = vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, mt};
     VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &b->m)); VKCHK(vkBindBufferMemory(V.dev, b->b, b->m, 0));
     void *m; VKCHK(vkMapMemory(V.dev, b->m, 0, VK_WHOLE_SIZE, 0, &m)); b->p = m;
     b->used = n; *buf = b->b; *off = 0; return b->p;
