@@ -63,6 +63,7 @@ typedef struct thr {
     int spin_fail; uint32_t nblock;   // block(): spins in a row that ended with no wake (a thread whose waits are long spins again only every 16th wait), waits so far
     uint64_t wseq;             // Sequence number of wait registration: at equal priority first come, first woken (same order as the Horizon kernel's KThread wait tree)
     struct thr *next;          // Wait chain
+    struct thr **pprev;        // The pointer that points at this thread in the wait chain (NULL: not in it): unlinking without walking the chain
     struct thr *all;           // All-threads chain (for the state dump)
     int last_svc; uint64_t last_lr;
     int closed;                // Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
@@ -184,10 +185,13 @@ int dm_yield_to_core_peers(unsigned max_us) {
 }
 
 // ---------- Wait primitives (called holding G) ----------
+// The wait chain is doubly linked (pprev): every wake unlinked by walking it, and with Breath of the Wild's ~50 guest threads mostly waiting, its main thread's
+// lock handoffs (a walk to pick, one to find more waiters, one to unlink) were 7% of its CPU time, most of it cache misses on the threads' records
 static void wait_unlink(thr_t *t) {
-    for (thr_t **p = &g_wait; *p; p = &(*p)->next) if (*p == t) { *p = t->next; break; }
-    t->next = NULL;
+    if (t->pprev) { *t->pprev = t->next; if (t->next) t->next->pprev = t->pprev; }
+    t->pprev = NULL; t->next = NULL;
 }
+static void wait_link(thr_t *t) { t->next = g_wait; if (g_wait) g_wait->pprev = &t->next; t->pprev = &g_wait; g_wait = t; }
 // Pick a waiter in kernel order: numerically lower priority first, at equal priority the earlier registered first (holding G). kind 1 matches by lock address, 2 by condition key, 3 by address
 static uint64_t g_wseq;
 static thr_t *pick(int kind, uint64_t a) {
@@ -205,7 +209,7 @@ static void wake(thr_t *t, int64_t res) {
 }
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
 static int64_t block(thr_t *t, int kind, int64_t ns) {
-    t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
+    t->wkind = kind; t->woke = 0; wait_link(t); t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     struct timespec dl;
     int det_wait = ns > 0 && dm_detclock_enabled();
@@ -246,9 +250,11 @@ static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic
 
 // Release the lock at addr: hand it to the first thread waiting on it, or clear it to zero (holding G)
 static void lock_handoff(uint64_t addr) {
-    thr_t *w = pick(1, addr); int more = 0;
+    thr_t *w = NULL; int n = 0;   // pick(1, addr) and whether another waits too, in one walk
+    for (thr_t *t = g_wait; t; t = t->next) { if (t->wkind != 1 || t->waddr != addr) continue; n++;
+        if (!w || t->prio < w->prio || (t->prio == w->prio && t->wseq < w->wseq)) w = t; }
+    int more = n > 1;
     if (!w) { st32(addr, 0); return; }
-    for (thr_t *t = g_wait; t; t = t->next) if (t != w && t->wkind == 1 && t->waddr == addr) { more = 1; break; }
     st32(addr, w->wtag | (more ? WAITERS_BIT : 0));
     wake(w, 0);
 }
