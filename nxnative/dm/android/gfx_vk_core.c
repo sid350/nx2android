@@ -1337,6 +1337,40 @@ void vk_ubd_read(uint64_t a, uint64_t n, uint8_t *dst) {
     if (vk_gpu_pending(a, n)) { static int k; g_ubd_racy++; if (k < 20) { k++; int cov = 0; for (int i = 0; i < g_nubd; i++) if (g_ubd[i].lo <= a && a + n <= g_ubd[i].hi) cov = 1;
         VKLOG("[RED] a CPU read of %#llx +%llu (%s) overlaps a GPU write not known to be complete", (unsigned long long)a, (unsigned long long)n, cov ? "covered by a deferred update" : "partly from memory"); } }
     memcpy(dst, (const void *)(uintptr_t)a, n);
+    // DM_VK_UBD_COVER=1 (start-up): the updates are laid over memory newest first, each only where no newer one wrote: the same bytes. Their bytes are in scratch
+    // memory, which the CPU reads uncached (Adreno 830 with Turnip: 2.25 GB/s against 61-72 for the other copies), and Breath of the Wild rewrites the same ~0.7 KB
+    // of a 64 KB constant buffer before each draw, so each shadow read every update landed in its submission so far (hundreds) over the same bytes
+    static int cover = -1; if (cover < 0) { const char *e = getenv("DM_VK_UBD_COVER"); cover = e && atoi(e) > 0; }
+    if (cover) {
+        enum { NCV = 64 }; uint64_t cv[NCV][2]; int ncv = 0, full = 0;   // the bytes written so far (newest first): disjoint, sorted by start
+        uint64_t done = g_ninfl ? vk_fence_done() : 0;
+        for (int pass = 0; pass < 2 && !full; pass++) for (int i = pass ? g_ninfl - 1 : g_nubd - 1; i >= 0 && !full; i--) {
+            uint64_t elo, ehi; const uint8_t *src;
+            if (!pass) { elo = g_ubd[i].lo; ehi = g_ubd[i].hi; src = g_ubd[i].p; }
+            else { if (g_infl[i].fence <= done) continue; elo = g_infl[i].lo; ehi = g_infl[i].hi; src = g_infl[i].data; }
+            uint64_t lo = elo > a ? elo : a, hi = ehi < a + n ? ehi : a + n; if (lo >= hi) continue;
+            // the parts of [lo, hi) no newer update wrote
+            uint64_t p = lo; int j = 0;
+            while (p < hi) {
+                while (j < ncv && cv[j][1] <= p) j++;
+                uint64_t e = j < ncv && cv[j][0] < hi ? cv[j][0] : hi;
+                if (j < ncv && cv[j][0] <= p) { p = cv[j][1]; continue; }   // covered from p on
+                if (e > p) memcpy(dst + (p - a), src + (p - elo), e - p);
+                p = e;
+            }
+            // add [lo, hi) to the covered set, merging
+            if (ncv == NCV) { full = 1; break; }
+            int k = 0; while (k < ncv && cv[k][1] < lo) k++;
+            uint64_t nlo = lo, nhi = hi; int m = k; while (m < ncv && cv[m][0] <= nhi) { if (cv[m][0] < nlo) nlo = cv[m][0]; if (cv[m][1] > nhi) nhi = cv[m][1]; m++; }
+            memmove(&cv[k + 1], &cv[m], sizeof cv[0] * (size_t)(ncv - m)); ncv -= m - k - 1; cv[k][0] = nlo; cv[k][1] = nhi;
+            if (ncv == 1 && cv[0][0] <= a && cv[0][1] >= a + n) full = 1;   // every byte from an update
+        }
+        if (!full || ncv != 1 || cv[0][0] > a || cv[0][1] < a + n) {
+            if (full && !(ncv == 1 && cv[0][0] <= a && cv[0][1] >= a + n)) goto ordered;   // the interval list ran out: the plain way, over what was copied
+        }
+        return;
+    }
+    ordered:
     if (g_ninfl) { uint64_t done = vk_fence_done();
         for (int i = 0; i < g_ninfl; i++) { if (g_infl[i].fence <= done) continue; uint64_t lo = g_infl[i].lo > a ? g_infl[i].lo : a, hi = g_infl[i].hi < a + n ? g_infl[i].hi : a + n;
             if (lo < hi) memcpy(dst + (lo - a), g_infl[i].data + (lo - g_infl[i].lo), hi - lo); } }
@@ -1360,6 +1394,16 @@ int vk_ubd_shadow(uint64_t a, uint64_t n, VkBuffer *buf, VkDeviceSize *off) {
         for (int i = g_ninfl - 1; i >= 0 && !newer; i--) if (g_infl[i].seq > c[k].seq && g_infl[i].lo < a + n && a < g_infl[i].hi) newer = 1;
         if (!newer) { c[k].gen = g_ubd_gen; g_ubd_shc_kept++; *buf = c[k].b; *off = c[k].o; return 1; }
     }
+    { static int nl = -1; if (nl < 0) { const char *e = getenv("DM_VK_UBD_LOG"); nl = e ? atoi(e) : 0; }   // DM_VK_UBD_LOG=<n> (start-up): the first n shadows of 32 KB or more and the deferred updates over them
+      if (nl > 0 && n >= 32768) { nl--; char t[900]; int o = snprintf(t, sizeof t, "ubd shadow %#llx +%llu (prev at this slot %#llx +%llu): %d deferred, over it:", (unsigned long long)a, (unsigned long long)n, (unsigned long long)c[k].a, (unsigned long long)c[k].n, g_nubd);
+        for (int i = 0; i < g_nubd && o < (int)sizeof t - 40; i++) if (g_ubd[i].lo < a + n && a < g_ubd[i].hi) o += snprintf(t + o, sizeof t - (size_t)o, " +%lld/%llu", (long long)(g_ubd[i].lo - a), (unsigned long long)(g_ubd[i].hi - g_ubd[i].lo));
+        VKLOG("%s", t); } }
+    { static int bench; if (!bench && n >= 32768 && getenv("DM_VK_UBD_BENCH")) { bench = 1;   // DM_VK_UBD_BENCH=1: one measurement of the copies a shadow can be made with
+        VkBuffer tb; VkDeviceSize to; uint8_t *sc = vk_scratch(n, V.props.limits.minUniformBufferOffsetAlignment, &tb, &to); uint8_t *hm = malloc(n); double r[4] = {0};
+        for (int m = 0; m < 4; m++) { struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (int it = 0; it < 64; it++) { if (m == 0) memcpy(hm, (const void *)(uintptr_t)a, n); else if (m == 1) memcpy(sc, hm, n); else if (m == 2) memcpy(sc, (const void *)(uintptr_t)a, n); else memcpy(hm + (it & 1) * 0, sc, n); }
+            clock_gettime(CLOCK_MONOTONIC, &t1); double s = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9; r[m] = 64.0 * n / s / 1e9; }
+        VKLOG("ubd copy speeds (GB/s, 64 x %llu bytes): game memory -> malloc %.2f, malloc -> scratch %.2f, game memory -> scratch %.2f, scratch -> malloc %.2f", (unsigned long long)n, r[0], r[1], r[2], r[3]); free(hm); } }
     uint8_t *d = vk_scratch(n, V.props.limits.minUniformBufferOffsetAlignment, buf, off); vk_ubd_read(a, n, d); g_ubd_bytes += n;
     c[k].a = a; c[k].n = n; c[k].gen = g_ubd_gen; c[k].seq = g_ubd_seq; c[k].fence = g_fence; c[k].drops = g_ubd_drops; c[k].b = *buf; c[k].o = *off; g_ubd_shadows++; g_ubd_big += n >= 32768;
     return 1;
