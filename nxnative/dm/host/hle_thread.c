@@ -386,8 +386,9 @@ static void ctx_fill(const thr_t *t, hz_ctx_t *o) {   // holding G, t is stopped
 }
 
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
+__attribute__((weak)) void dm_perf_main_thread(void) {}   // Android (perf_android.c, DM_PIN_MAIN): the main thread's CPU placement
 uint32_t svc_thread_main_init(void) {
-    pthread_key_create(&g_keythr, NULL);
+    pthread_key_create(&g_keythr, NULL); dm_perf_main_thread();
     qos_map_init();
     pause_install();
     thr_t *t = calloc(1, sizeof *t);

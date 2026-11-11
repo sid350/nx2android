@@ -140,6 +140,22 @@ void dm_perf_replay_thread(void) {
     LOG("[perf] replay thread on CPUs%s (%s, up to %ld MHz)", l, prime ? "prime" : "big", hi);
 }
 
+// DM_PIN_MAIN (start-up): the game's main thread (the host thread svc_thread_main_init makes the guest's main thread) kept to the fastest cores, as DM_PIN_REPLAY keeps
+// the replay: prime or big. Breath of the Wild on the Red Magic Astra (Snapdragon 8 Elite under its thermal caps, prime cores 2.84 GHz, the others 2.4): its main
+// thread (~12 ms of CPU a frame, the frame's critical path once the replay was cheaper) moved between cores 0, 3, 5 and 6 while the replay held the prime cores
+void dm_perf_main_thread(void) {
+    const char *e = getenv("DM_PIN_MAIN"); if (!e || !*e || !strcmp(e, "0")) return;
+    int prime = !strcmp(e, "prime"); long n = sysconf(_SC_NPROCESSORS_CONF); if (n > 32) n = 32;
+    long mhz[32] = {0}, hi = 0, lo = 0;
+    for (long c = 0; c < n; c++) { char p[96]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c); FILE *f = fopen(p, "r");
+        if (f) { if (fscanf(f, "%ld", &mhz[c]) != 1) mhz[c] = 0; fclose(f); } mhz[c] /= 1000; if (mhz[c] > hi) hi = mhz[c]; if (mhz[c] && (!lo || mhz[c] < lo)) lo = mhz[c]; }
+    if (!hi || hi == lo) { LOG("[perf] DM_PIN_MAIN: the cores' clocks are unknown or all alike, not pinned"); return; }
+    cpu_set_t set; CPU_ZERO(&set); char l[96]; size_t o = 0;
+    for (long c = 0; c < n; c++) if (prime ? mhz[c] == hi : mhz[c] > lo) { CPU_SET(c, &set); o += snprintf(l + o, sizeof l - o, " %ld", c); }
+    if (sched_setaffinity(0, sizeof set, &set)) { LOG("[perf] DM_PIN_MAIN: sched_setaffinity refused"); return; }
+    LOG("[perf] the game's main thread on CPUs%s (%s, up to %ld MHz)", l, prime ? "prime" : "big", hi);
+}
+
 static int64_t g_work_start;
 // ---- adaptive frame rate: when the frames do not fit the period the game asks for, presentation steps to a longer one the display divides evenly
 // (60 → 40 → 30 fps; 40 asks the display for 120 Hz), and back when they fit the shorter one with room; a steady rate instead of alternating
