@@ -21,3 +21,13 @@ env	DM_PIN_REPLAY=prime
 #env	DM_VK_UBD_COVER=1
 #env	DM_VK_MT_REPLAY=1
 #env	DM_FPS_HOLD=off
+# 60 fps set (2026-11-12, branch perf/vk-descriptor-cache a4248fa, Turnip V39 Patched, the same save and route, the tablet warm: GPU capped at 607 MHz,
+# SoC 57-59 C): the reference's three settings plus the five below gave frame p50 16.6 ms, p95 19.0-19.5 ms, 67-150 frames dropped in runs of 2-5 minutes
+# (0.8% over 5 minutes; the reference dropped 350-760 in 2). DM_VK_X_CUTANY made the difference (the GPU starts on the frame's passes as they are recorded;
+# its main thread's waits in nvnSyncWait fell from 20 s to 2.3 s in 45); screen recordings with and without it showed no one-frame flicker.
+# DM_RENDER_SCALE=0.75 on top dropped 29 frames in 2 minutes.
+#env	DM_VK_POOL_TC=1
+#env	DM_VK_SCRATCH_CACHED=1
+#env	DM_SVC_SPIN=0
+#env	DM_VK_CB_SPREAD=1
+#env	DM_VK_X_CUTANY=1
