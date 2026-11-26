@@ -41,3 +41,4 @@ mem_used	0x4c00000
 # Conditional rendering followed (SetRenderEnableConditional): the setting the game was tested with. The battle menu's black background was a masked texture clear
 # (gfx_vk_exec.c clear_tex_masked), not this
 render_cond	on
+present_interval	display

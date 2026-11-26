@@ -65,7 +65,7 @@ for f in files:
 check('profiles hold data only (code only as patches.py)', not bad, ', '.join(bad))
 # a game folder holds only the files the tools read: the page is README.md (ANDROID.md is its old name, d12d4d49); no test output (smoke.tsv), notes or subfolders
 GAME_FILES = {'README.md', 'android.tsv', 'game.tsv', 'patches.py', 'fps_locks.tsv', 'ue_malloc.tsv',
-              'bf_want.tsv', 'pso_manifest.tsv', 'pso_pairs.tsv', 'shader_facts.tsv', 'shader_facts_manual.tsv', 'shader_map.tsv',
+              'bf_want.tsv', 'android_shader_stores.tsv', 'pso_manifest.tsv', 'pso_pairs.tsv', 'shader_facts.tsv', 'shader_facts_manual.tsv', 'shader_map.tsv',
               'shader_map.tsv.conflicts.tsv', 'shader_pairs.tsv', 'android_shader_handles.tsv', 'vk_capture.tsv', 'gl_capture.tsv'}
 bad = []
 for f in files:
