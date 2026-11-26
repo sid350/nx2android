@@ -121,8 +121,9 @@ class AndroidProfile:
     @property
     def pacing(self): return self.get('pacing', 'adaptive')
     @property
-    def env(self):   # ['KEY=VALUE', ...]: the pacing preset's rows, then the profile's env rows
-        return PACING.get(self.pacing, []) + self.values('env')
+    def env(self):   # ['KEY=VALUE', ...]: the pacing preset's rows, then the profile's env rows; this fork adds DM_GPU_TURBO=need to every game without a DM_GPU_TURBO row of its own
+        rows = PACING.get(self.pacing, []) + self.values('env')
+        return rows if any(r.startswith('DM_GPU_TURBO=') for r in rows) else [*rows, 'DM_GPU_TURBO=need']
 
     def overlay_table(self):
         """The gamepad layouts: the default ones with this profile's moves (a moved control's x is a fraction of the window's width: its anchor, no offset)"""
